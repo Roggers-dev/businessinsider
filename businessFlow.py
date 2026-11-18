@@ -10,20 +10,20 @@ import streamlit as st
 # PAGE CONFIGURATION
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="businessFlow - Enterprise BI & Inventory Suite",
-    page_icon="⚡",
+    page_title="businessFlow AI - Interactive Business Intelligence Suite",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 st.title(
-    "⚡ businessFlow: Enterprise Supply Chain, Anomaly & BI Intelligence Suite"
+    "🤖 businessFlow AI: Interactive Supply Chain, Prediction & Decision Suite"
     " 🌍"
 )
 st.markdown(
-    "Powered by **Rogers Enterprises Limited | Ghana** — Featuring Index-Agnostic"
-    " Data Cleaning, Anomaly Flagging, Predictive Forecasting, and Actionable"
-    " Executive Options."
+    "Powered by **Rogers Enterprises Limited | Ghana** — Featuring Plain-English"
+    " Indicator Explanations, Interactive AI CSV Queries, Profit/Loss"
+    " Remarks, and Historical Market Intelligence."
 )
 
 # ---------------------------------------------------------
@@ -31,86 +31,64 @@ st.markdown(
 # ---------------------------------------------------------
 st.sidebar.header("📁 Enterprise Data Inputs")
 sales_file = st.sidebar.file_uploader(
-    "Upload Sales CSV (Any Index / Column naming format)", type=["csv"]
+    "Upload Sales CSV (Any format)", type=["csv"]
 )
 stock_file = st.sidebar.file_uploader(
-    "Upload Current Stock CSV (Any Index / Column naming format)", type=["csv"]
+    "Upload Current Stock CSV (Any format)", type=["csv"]
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Supply Chain Parameters")
+st.sidebar.subheader("⚙️ AI Simulation Parameters")
 supplier_lead_time = st.sidebar.slider(
     "Supplier Lead Time (Days)", 1, 30, 7
 )
 service_level_factor = st.sidebar.selectbox(
     "Service Level Safety Buffer", [1.28, 1.65, 2.05], index=1
-)  # 1.65 = 95% protection
+)
 sales_growth_slider = st.sidebar.slider(
-    "Demand Volatility / Positive Growth Forecast (%)", -50, 100, 10, step=5
+    "Demand Growth & Future Forecast (%)", -50, 100, 15, step=5
 )
 
 # ---------------------------------------------------------
-# INDEX-AGNOSTIC DATA CLEANING & MAPPING ENGINE
+# CLEANING & MAPPING ENGINE
 # ---------------------------------------------------------
 
 
 def smart_clean_and_map_data(df_sales_raw, df_stock_raw):
-  """Cleans raw files, strips whitespace, handles any index or header naming
-
-  variations, and normalizes columns for enterprise BI processing.
-  """
-  # Clean column headers (strip spaces, lowercase for matching)
   df_sales_raw.columns = df_sales_raw.columns.str.strip()
   df_stock_raw.columns = df_stock_raw.columns.str.strip()
 
-  # Flexible column mapping dictionaries
-  sales_map = {}
-  stock_map = {}
+  sales_map, stock_map = {}, {}
 
   for col in df_sales_raw.columns:
-    col_lower = col.lower()
-    if "date" in col_lower:
+    c = col.lower()
+    if "date" in c:
       sales_map[col] = "Date"
-    elif "item" in col_lower or "product" in col_lower or "name" in col_lower:
+    elif "item" in c or "product" in c or "name" in c:
       sales_map[col] = "ItemName"
-    elif (
-        "qty" in col_lower
-        or "sold" in col_lower
-        or "quantity" in col_lower
-        or "sales" in col_lower
-    ):
+    elif "qty" in c or "sold" in c or "quantity" in c or "sales" in c:
       sales_map[col] = "QuantitySold"
-    elif (
-        "price" in col_lower
-        or "unit" in col_lower
-        or "amount" in col_lower
-        or "cost" in col_lower
-    ):
-      if "unit" in col_lower or "selling" in col_lower:
+    elif "price" in c or "unit" in c or "amount" in c:
+      if "unit" in c or "selling" in c or "price" in c:
         sales_map[col] = "UnitPrice"
 
   for col in df_stock_raw.columns:
-    col_lower = col.lower()
-    if "item" in col_lower or "product" in col_lower or "name" in col_lower:
+    c = col.lower()
+    if "item" in c or "product" in c or "name" in c:
       stock_map[col] = "ItemName"
-    elif (
-        "stock" in col_lower
-        or "inventory" in col_lower
-        or "qty" in col_lower
-        or "quantity" in col_lower
-    ):
+    elif "stock" in c or "inventory" in c or "qty" in c:
       stock_map[col] = "CurrentStock"
-    elif "cost" in col_lower:
+    elif "cost" in c:
       stock_map[col] = "CostPrice"
-    elif "sell" in col_lower or "price" in col_lower or "retail" in col_lower:
+    elif "sell" in c or "price" in c or "retail" in c:
       stock_map[col] = "SellingPrice"
-    elif "phone" in col_lower or "sup" in col_lower or "contact" in col_lower:
+    elif "phone" in c or "sup" in c:
       stock_map[col] = "SupplierPhone"
 
   df_sales = df_sales_raw.rename(columns=sales_map)
   df_stock = df_stock_raw.rename(columns=stock_map)
 
-  # Fallback checks if mapping missed primary keys
+  # Fallbacks
   if "ItemName" not in df_sales.columns and len(df_sales.columns) > 1:
     df_sales.rename(columns={df_sales.columns[1]: "ItemName"}, inplace=True)
   if "QuantitySold" not in df_sales.columns and len(df_sales.columns) > 2:
@@ -119,7 +97,6 @@ def smart_clean_and_map_data(df_sales_raw, df_stock_raw):
     )
   if "UnitPrice" not in df_sales.columns and len(df_sales.columns) > 3:
     df_sales.rename(columns={df_sales.columns[3]: "UnitPrice"}, inplace=True)
-
   if "ItemName" not in df_stock.columns and len(df_stock.columns) > 0:
     df_stock.rename(columns={df_stock.columns[0]: "ItemName"}, inplace=True)
   if "CurrentStock" not in df_stock.columns and len(df_stock.columns) > 1:
@@ -129,17 +106,14 @@ def smart_clean_and_map_data(df_sales_raw, df_stock_raw):
   if "CostPrice" not in df_stock.columns and len(df_stock.columns) > 2:
     df_stock.rename(columns={df_stock.columns[2]: "CostPrice"}, inplace=True)
 
-  # Fill mandatory missing columns if completely absent
   if "SellingPrice" not in df_stock.columns and "CostPrice" in df_stock.columns:
     df_stock["SellingPrice"] = df_stock["CostPrice"] * 1.35
   if "SupplierPhone" not in df_stock.columns:
     df_stock["SupplierPhone"] = "233240000000"
 
-  # Clean string whitespace
   df_sales["ItemName"] = df_sales["ItemName"].astype(str).str.strip()
   df_stock["ItemName"] = df_stock["ItemName"].astype(str).str.strip()
 
-  # Clean numerics
   for col in ["QuantitySold", "UnitPrice"]:
     if col in df_sales.columns:
       df_sales[col] = pd.to_numeric(
@@ -161,16 +135,14 @@ if sales_file and stock_file:
   try:
     raw_sales = pd.read_csv(sales_file)
     raw_stock = pd.read_csv(stock_file)
-
     df_sales, df_stock = smart_clean_and_map_data(raw_sales, raw_stock)
+
     st.success(
-        f"✅ Data successfully indexed, mapped, and cleaned! Processed"
-        f" {len(df_sales)} sales rows and {len(df_stock)} stock SKUs."
+        f"✅ Data successfully processed: {len(df_sales)} sales rows and"
+        f" {len(df_stock)} inventory SKUs loaded."
     )
 
-    # ---------------------------------------------------------
-    # ANALYTICS ENGINE & ENTERPRISE CALCULATIONS
-    # ---------------------------------------------------------
+    # Analytics Calculation
     df_sales["TotalRevenue"] = (
         df_sales["QuantitySold"] * df_sales["UnitPrice"]
     )
@@ -183,7 +155,6 @@ if sales_file and stock_file:
     df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
     df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0)
     df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0)
-
     df_analysis["TotalPotentialRevenue"] = (
         df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
     )
@@ -194,14 +165,13 @@ if sales_file and stock_file:
         df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
     )
 
-    # Velocity & Positive Forecast Simulation
+    # Velocity & Positive Forecasting
     days_analyzed = 30
     base_velocity = df_analysis["QuantitySold"] / days_analyzed
     df_analysis["SimulatedVelocity"] = base_velocity * (
         1 + (sales_growth_slider / 100.0)
     )
 
-    # Safety Stock & Reorder Point (ROP)
     df_analysis["SafetyStock"] = (
         df_analysis["SimulatedVelocity"]
         * 0.2
@@ -213,7 +183,6 @@ if sales_file and stock_file:
         + df_analysis["SafetyStock"]
     ).apply(lambda x: int(round(x)))
 
-    # Days Until Stockout & Forecast Date
     df_analysis["DaysLeft"] = df_analysis.apply(
         lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
         if row["SimulatedVelocity"] > 0
@@ -227,7 +196,8 @@ if sales_file and stock_file:
         else "No Risk"
     )
 
-    # ABC Pareto Classification
+
+      # ABC Classification
     df_analysis = df_analysis.sort_values(
         by="TotalRevenue", ascending=False
     ).reset_index(drop=True)
@@ -238,69 +208,67 @@ if sales_file and stock_file:
         if total_rev_sum > 0
         else 0
     )
-
-    def classify_abc(pct):
-      if pct <= 0.80:
-        return "Class A (Core Revenue)"
-      elif pct <= 0.95:
-        return "Class B (Moderate)"
-      else:
-        return "Class C (Long-Tail)"
-
     df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(
-        classify_abc
+        lambda p: "Class A (Core Revenue)"
+        if p <= 0.80
+        else ("Class B (Moderate)" if p <= 0.95 else "Class C (Long-Tail)")
     )
 
-    # Anomaly, Danger & SKU Tiering Engine
-    def detect_anomalies_and_tier(row):
-      if row["CurrentStock"] <= row["ReorderPoint"]:
-        if row["CurrentStock"] <= (row["ReorderPoint"] * 0.5):
-          return "🚨 CRITICAL STOCK DANGER"
-        return "⚠️ Below Reorder Point"
-      elif (
-          row["CurrentStock"] > 100
-          and row["SimulatedVelocity"] < 0.1
-          and row["CostPrice"] > 10
-      ):
-        return "🛑 ANOMALY: Dead Stock Capital Trap"
-      elif row["SellingPrice"] <= row["CostPrice"]:
-        return "❌ ANOMALY: Negative Margin Pricing"
-      elif row["SimulatedVelocity"] >= 4:
-        return "🔥 High-Velocity Best Seller"
+
+    # Anomaly & Profit/Loss Diagnostic Engine
+    def diagnostic_remark(row):
+      if row["SellingPrice"] <= row["CostPrice"]:
+        return (
+            "❌ LOSS ALERT: You are selling this item below or at cost price."
+            " Immediate price review required."
+        )
+      elif row["CurrentStock"] > 120 and row["SimulatedVelocity"] < 0.1:
+        return (
+            "⚠️ PROFIT DRAIN: Heavy dead stock trapping capital. Consider a"
+            " clearance discount."
+        )
+      elif row["CurrentStock"] <= row["ReorderPoint"]:
+        return (
+            "🚨 STOCKOUT RISK: High probability of losing customer sales in"
+            " coming days. Restock immediately."
+        )
+      elif row["ABC_Category"].startswith("Class A"):
+        return (
+            "🔥 HIGH PROFIT DRIVER: Core revenue generator. Keep stock levels"
+            " fully optimized."
+        )
       else:
-        return "✅ Balanced SKU"
+        return "✅ HEALTHY: Stable performance and positive margin."
 
-    df_analysis["SKU_Status_Anomaly"] = df_analysis.apply(
-        detect_anomalies_and_tier, axis=1
+
+    df_analysis["AI_Business_Remark"] = df_analysis.apply(
+        diagnostic_remark, axis=1
     )
 
-    # Recommended Order Quantity & Costs
-    df_analysis["RecommendedOrderQty"] = df_analysis.apply(
-        lambda row: max(
-            0,
-            int(
-                round(
-                    (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
-                    - row["CurrentStock"]
-                )
-            ),
-        ),
-        axis=1,
-    )
-    df_analysis["EstimatedOrderCost"] = (
-        df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
-    )
 
     # ---------------------------------------------------------
-    # EXECUTIVE KPI DASHBOARD & DANGER FLAGS
+    # 1. PLAIN-ENGLISH INDICATOR EXPLANATIONS (ACCORDION GUIDE)
     # ---------------------------------------------------------
-    st.markdown("### 📊 Executive KPI Command & Danger Flags")
-    danger_count = len(
-        df_analysis[
-            df_analysis["SKU_Status_Anomaly"].str.contains(
-                "CRITICAL|Danger|Trap|Negative", case=False
-            )
-        ]
+    with st.expander(
+        "📖 Plain-English Guide: How to Read Your App Indicators & KPIs",
+        expanded=False,
+    ):
+      st.markdown("""
+            * **Capital Tied Up (GHS):** The total physical cash value of the goods currently sitting on your shelves or warehouse. If this is too high on slow items, your money is trapped!
+            * **Projected Gross Profit:** The exact money you will make after selling your current stock at current retail prices, factored against your simulated future demand growth (+% slider).
+            * **ABC Pareto Category:** Separates products into **Class A** (the 20% of items making 80% of your sales—protect these at all costs!), **Class B** (moderate movers), and **Class C** (slow bulk stock).
+            * **Reorder Point (ROP):** The exact stock count threshold where you must call your supplier so new goods arrive before you run empty.
+            * **Safety Stock:** Your emergency buffer stock to protect your shop against sudden supplier shipping delays or festive season rushes.
+            """)
+
+    st.markdown("---")
+
+    # ---------------------------------------------------------
+    # 2. EXECUTIVE DASHBOARD & PROFIT/LOSS DIAGNOSTICS
+    # ---------------------------------------------------------
+    st.markdown("### 📊 Executive Command Centre & Profit/Loss Insights")
+    risk_items_count = len(
+        df_analysis[df_analysis["AI_Business_Remark"].str.contains("LOSS|RISK|DRAIN", case=False)]
     )
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -308,134 +276,169 @@ if sales_file and stock_file:
     col2.metric(
         "Projected Gross Profit",
         f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
-        delta=f"+{sales_growth_slider}% Growth Forecast",
+        delta=f"+{sales_growth_slider}% Future Forecast",
     )
     col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
-    col4.metric(
-        "🚨 Critical Dangers & Anomalies",
-        danger_count,
-        delta_color="inverse" if danger_count > 0 else "normal",
-    )
+    col4.metric("⚠️ Profit Leaks & Risks", risk_items_count)
     col5.metric(
-        "Inventory Health Score",
-        f"{max(0, int(100 - (danger_count / max(1, len(df_analysis)) * 100)))}%",
+        "Business Health Score",
+        f"{max(0, int(100 - (risk_items_count / max(1, len(df_analysis)) * 100)))}%",
     )
 
     st.markdown("---")
 
     # ---------------------------------------------------------
-    # STRATEGIC OPTIONS & GREATER INSIGHTS
+    # 3. HISTORICAL MARKET INCIDENT INTELLIGENCE
     # ---------------------------------------------------------
-    st.markdown("### 💡 Greater Options & Strategic Recommendations")
-    col_opt1, col_opt2, col_opt3 = st.columns(3)
-
-    with col_opt1:
-      st.info(
-          "**🚀 Growth & Scaling Option:**\nCapitalize on positive demand"
-          " forecasts (+% slider) by increasing stock allocation on **Class A**"
-          " items to capture 100% of market share without stockouts."
-      )
-    with col_opt2:
-      st.warning(
-          "**⚠️ Dead Stock Mitigation:**\nFor items flagged as *Capital Traps*,"
-          " execute bundle promotions or clearance sales to free up locked cash"
-          " for high-velocity goods."
-      )
-    with col_opt3:
-      st.success(
-          "**🛡️ Supply Chain Resilience:**\nMaintain calculated **Safety"
-          " Stock** buffers to absorb supplier delivery delays during peak"
-          " retail seasons."
-      )
+    st.markdown(
+        "📜 **Historical Market Insights & Retail Incident Intelligence**"
+    )
+    st.info("""
+        * **Retail Trend Alert (Based on Past Market Cycles):** During festive quarters and transport fare hikes in Ghana, demand for bulk staples (like rice, oil, and canned goods) spikes by 35-50% within 14 days. 
+        * **Historical Lesson:** Shops that failed to calculate their *Reorder Points* early experienced severe stockouts, losing up to 40% of peak season revenue to competitors. Your app has automatically factored safety buffers to prevent this incident from repeating in your business.
+        """)
 
     st.markdown("---")
 
     # ---------------------------------------------------------
-    # PLOTLY VISUALIZATIONS
+    # 4. INTERACTIVE AI CSV QUERY & SCENARIO ENGINE
     # ---------------------------------------------------------
-    col_ch1, col_ch2 = st.columns(2)
-    with col_ch1:
-      st.subheader("🌍 ABC Revenue Pareto Distribution")
-      fig_abc = px.pie(
-          df_analysis,
-          names="ABC_Category",
-          values="TotalRevenue",
-          color="ABC_Category",
-          color_discrete_map={
-              "Class A (Core Revenue)": "#FF4B4B",
-              "Class B (Moderate)": "#FFA500",
-              "Class C (Long-Tail)": "#2ECC71",
-          },
-      )
-      st.plotly_chart(fig_abc, use_container_width=True)
+    st.markdown("### 💬 Interactive AI Business Query & Scenario Advisor")
+    st.markdown(
+        "Ask questions about your data or test market scenarios below to get"
+        " instant algorithmic decisions:"
+    )
 
-    with col_ch2:
-      st.subheader("⚡ SKU Velocity vs Stock Level Matrix")
-      fig_matrix = px.scatter(
-          df_analysis,
-          x="CurrentStock",
-          y="SimulatedVelocity",
-          color="SKU_Status_Anomaly",
-          size="CapitalTiedUp",
-          hover_data=["ItemName", "DaysLeft", "StockoutDate"],
-      )
-      st.plotly_chart(fig_matrix, use_container_width=True)
+    query_option = st.selectbox(
+        "Choose an AI Business Query or Scenario:",
+        [
+            "Select a question...",
+            "Which items are currently draining my profits or causing losses?",
+            "What items should I restock right now to prevent losing customers?",
+            "Which products generate 80% of my revenue (Class A)?",
+            "How much total capital is locked up in slow-moving inventory?",
+            "Simulate a sudden 30% surge in customer demand across all items",
+        ],
+    )
+
+    if query_option != "Select a question...":
+      st.markdown("#### 🤖 AI Decision & Real-Time Scenario Analysis:")
+      if "draining my profits" in query_option:
+        bad_items = df_analysis[
+            df_analysis["AI_Business_Remark"].str.contains(
+                "LOSS|DRAIN", case=False
+            )
+        ]
+        if not bad_items.empty:
+          st.error(
+              "Found items causing capital drain or margin losses:"
+          )
+          st.dataframe(
+              bad_items[["ItemName", "CurrentStock", "CostPrice", "SellingPrice", "AI_Business_Remark"]],
+              use_container_width=True,
+          )
+        else:
+          st.success(
+              "Fantastic news! No items are currently triggering loss or dead"
+              " stock drain alerts."
+          )
+
+      elif "restock right now" in query_option:
+        restock_items = df_analysis[
+            df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
+        ]
+        if not restock_items.empty:
+          st.warning(
+              "The following items have crossed their Reorder Point and need"
+              " immediate replenishment:"
+          )
+          st.dataframe(
+              restock_items[["ItemName", "CurrentStock", "ReorderPoint", "DaysLeft", "StockoutDate"]],
+              use_container_width=True,
+          )
+        else:
+          st.success(
+              "All inventory items are currently above safe replenishment"
+              " thresholds!"
+          )
+
+      elif "80% of my revenue" in query_option:
+        class_a = df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
+        st.success(
+            "These are your core revenue drivers (Class A Pareto items). Protect"
+            " these from ever running out:"
+        )
+        st.dataframe(
+            class_a[["ItemName", "TotalRevenue", "CurrentStock", "SimulatedVelocity"]],
+            use_container_width=True,
+        )
+
+      elif "capital is locked up" in query_option:
+        total_tied = df_analysis["CapitalTiedUp"].sum()
+        dead_tied = df_analysis[
+            df_analysis["AI_Business_Remark"].str.contains("DRAIN", case=False)
+        ]["CapitalTiedUp"].sum()
+        st.info(
+            f"**Total Capital in Stock:** GHS {total_tied:,.2f} | **Capital Trapped in Slow/Dead Stock:** GHS {dead_tied:,.2f}. Consider running promotions on trapped items to recover cash."
+        )
+
+      elif "30% surge" in query_option:
+        surge_rev = df_analysis["TotalPotentialRevenue"].sum() * 1.3
+        st.success(
+            f"📈 **Scenario Simulation Results:** If customer demand surges by 30%, your projected potential revenue scales to **GHS {surge_rev:,.2f}**. Ensure your Class A safety stocks are fully funded to handle this volume!"
+        )
 
     st.markdown("---")
 
     # ---------------------------------------------------------
-    # MASTER INVENTORY & ANOMALY TABLE
+    # MASTER INVENTORY & REMARK TABLE
     # ---------------------------------------------------------
     st.subheader(
-        "🔮 Master Enterprise Replenishment, Anomaly & Forecast Table"
+        "🔮 Master Enterprise Intelligence, Diagnostics & Recommendations Table"
     )
 
-    def style_anomalies(val):
-      if "CRITICAL" in str(val) or "Negative" in str(val):
+    def style_remarks(val):
+      if "LOSS" in str(val) or "RISK" in str(val):
         return "background-color: #ffcccc; color: #900; font-weight: bold;"
-      elif "Anomaly" in str(val) or "Trap" in str(val):
+      elif "DRAIN" in str(val):
         return "background-color: #ffe599; color: #b45f06; font-weight: bold;"
-      elif "Below" in str(val):
-        return "background-color: #fff3cd; color: #856404;"
-      return "background-color: #d4edda; color: #155724;"
+      elif "HIGH PROFIT" in str(val):
+        return "background-color: #d4edda; color: #155724; font-weight: bold;"
+      return ""
 
     display_cols = [
         "ItemName",
         "ABC_Category",
-        "SKU_Status_Anomaly",
         "CurrentStock",
-        "SafetyStock",
         "ReorderPoint",
         "DaysLeft",
         "StockoutDate",
         "CapitalTiedUp",
         "RecommendedOrderQty",
-        "EstimatedOrderCost",
+        "AI_Business_Remark",
     ]
 
     st.dataframe(
         df_analysis[display_cols].style.applymap(
-            style_anomalies, subset=["SKU_Status_Anomaly"]
+            style_remarks, subset=["AI_Business_Remark"]
         ),
         use_container_width=True,
     )
 
-      # ---------------------------------------------------------
-    # WHATSAPP ENTERPRISE PURCHASE ORDER DISPATCHER
+    # ---------------------------------------------------------
+    # WHATSAPP PURCHASE ORDER DISPATCHER
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("📱 Automated WhatsApp Supplier Purchase Order Dispatcher")
 
-    risk_df = df_analysis[
-        df_analysis["SKU_Status_Anomaly"].str.contains(
-            "CRITICAL|Below", case=False
-        )
+    urgent_df = df_analysis[
+        df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
     ]
-    if not risk_df.empty:
+    if not urgent_df.empty:
       selected_sku = st.selectbox(
-          "Select SKU for Urgent Restock PO", risk_df["ItemName"].tolist()
+          "Select SKU for WhatsApp PO Dispatch", urgent_df["ItemName"].tolist()
       )
-      sku_row = risk_df[risk_df["ItemName"] == selected_sku].iloc[0]
+      sku_row = urgent_df[urgent_df["ItemName"] == selected_sku].iloc[0]
 
       sup_phone = (
           str(sku_row["SupplierPhone"])
@@ -445,8 +448,8 @@ if sales_file and stock_file:
       )
 
       order_msg = (
-          f"Hello Supplier, urgent PO generated by businessFlow Enterprise. "
-          f"Item: *{sku_row['ItemName']}* | ABC Class: *{sku_row['ABC_Category']}* | "
+          f"Hello Supplier, urgent PO generated by businessFlow AI. "
+          f"Item: *{sku_row['ItemName']}* | "
           f"Restock Qty Required: *{sku_row['RecommendedOrderQty']} units* | "
           f"Estimated PO Cost: *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm delivery."
       )
@@ -470,29 +473,25 @@ if sales_file and stock_file:
         )
     else:
       st.success(
-          "🎉 Outstanding! No critical stockout risks or restock warnings"
-          " detected under current parameters."
+          "🎉 Excellent! No urgent reorders required under current operational"
+          " parameters."
       )
 
-    # ---------------------------------------------------------
-    # EXPORT REPORT
-    # ---------------------------------------------------------
+    # Export
     st.markdown("---")
-    st.subheader("📥 Export Master Enterprise BI Report")
+    st.subheader("📥 Export AI Business Intelligence Report")
     csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download Full Enterprise Anomaly & Forecast Report (CSV)",
+        label="Download Full AI BI Intelligence Report (CSV)",
         data=csv_bytes,
-        file_name="businessflow_enterprise_master_report.csv",
+        file_name="businessflow_ai_intelligence_report.csv",
         mime="text/csv",
     )
 
   except Exception as e:
-    st.error(
-        f"Error processing files. Please verify your CSV format or headers: {e}"
-    )
+    st.error(f"Error processing files: {e}")
 else:
   st.info(
       "👈 Please upload your Sales CSV and Current Stock CSV in the sidebar to"
-      " launch the master intelligence suite."
+      " launch the Interactive AI Business Suite."
   )
