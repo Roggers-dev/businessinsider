@@ -17,13 +17,12 @@ st.set_page_config(
 )
 
 st.title(
-    "🤖 businessFlow AI: Interactive Supply Chain, Prediction & Decision Suite"
-    " 🌍"
+    "🤖 businessFlow AI: Active Supply Chain, Prediction & Decision Suite 🌍"
 )
 st.markdown(
-    "Powered by **Rogers Enterprises Limited | Ghana** — Featuring Plain-English"
-    " Indicator Explanations, Interactive AI CSV Queries, Profit/Loss"
-    " Remarks, and Historical Market Intelligence."
+    "Powered by **Rogers Enterprises Limited | Ghana** — Featuring Instant"
+    " Plain-English Explanations, Active P&L Risk Flagging, and Interactive AI"
+    " Scenarios."
 )
 
 # ---------------------------------------------------------
@@ -196,8 +195,7 @@ if sales_file and stock_file:
         else "No Risk"
     )
 
-
-      # ABC Classification
+    # ABC Classification
     df_analysis = df_analysis.sort_values(
         by="TotalRevenue", ascending=False
     ).reset_index(drop=True)
@@ -214,69 +212,81 @@ if sales_file and stock_file:
         else ("Class B (Moderate)" if p <= 0.95 else "Class C (Long-Tail)")
     )
 
-
-    # Anomaly & Profit/Loss Diagnostic Engine
+    # Sensitive Diagnostic & P&L Remark Engine
     def diagnostic_remark(row):
-      if row["SellingPrice"] <= row["CostPrice"]:
+      margin = row["SellingPrice"] - row["CostPrice"]
+      if margin <= 0:
         return (
-            "❌ LOSS ALERT: You are selling this item below or at cost price."
-            " Immediate price review required."
+            "❌ LOSS ALERT: Selling price is at or below cost price! You are"
+            " losing money on every unit sold."
         )
-      elif row["CurrentStock"] > 120 and row["SimulatedVelocity"] < 0.1:
+      elif row["DaysLeft"] <= supplier_lead_time:
         return (
-            "⚠️ PROFIT DRAIN: Heavy dead stock trapping capital. Consider a"
-            " clearance discount."
+            f"🚨 CRITICAL STOCKOUT RISK: Only {row['DaysLeft']} days of stock"
+            " remaining. Restock immediately to avoid losing sales."
         )
-      elif row["CurrentStock"] <= row["ReorderPoint"]:
+      elif row["CurrentStock"] > 80 and row["SimulatedVelocity"] < 0.5:
         return (
-            "🚨 STOCKOUT RISK: High probability of losing customer sales in"
-            " coming days. Restock immediately."
+            "⚠️ CAPITAL DRAIN (Slow Moving): High inventory holding with low"
+            " sales velocity. Consider a discount promotion."
         )
       elif row["ABC_Category"].startswith("Class A"):
         return (
-            "🔥 HIGH PROFIT DRIVER: Core revenue generator. Keep stock levels"
-            " fully optimized."
+            "🔥 HIGH PROFIT DRIVER: Generates 80% of revenue. Keep fully"
+            " stocked."
         )
       else:
-        return "✅ HEALTHY: Stable performance and positive margin."
-
+        return (
+            "✅ STABLE MARGIN: Healthy stock level and positive profit margin."
+        )
 
     df_analysis["AI_Business_Remark"] = df_analysis.apply(
         diagnostic_remark, axis=1
     )
 
-
     # ---------------------------------------------------------
-    # 1. PLAIN-ENGLISH INDICATOR EXPLANATIONS (ACCORDION GUIDE)
+    # 1. VISIBLE PLAIN-ENGLISH GUIDANCE & EXPLANATIONS
     # ---------------------------------------------------------
-    with st.expander(
-        "📖 Plain-English Guide: How to Read Your App Indicators & KPIs",
-        expanded=False,
-    ):
-      st.markdown("""
-            * **Capital Tied Up (GHS):** The total physical cash value of the goods currently sitting on your shelves or warehouse. If this is too high on slow items, your money is trapped!
-            * **Projected Gross Profit:** The exact money you will make after selling your current stock at current retail prices, factored against your simulated future demand growth (+% slider).
-            * **ABC Pareto Category:** Separates products into **Class A** (the 20% of items making 80% of your sales—protect these at all costs!), **Class B** (moderate movers), and **Class C** (slow bulk stock).
-            * **Reorder Point (ROP):** The exact stock count threshold where you must call your supplier so new goods arrive before you run empty.
-            * **Safety Stock:** Your emergency buffer stock to protect your shop against sudden supplier shipping delays or festive season rushes.
-            """)
+    st.markdown("### 📖 Plain-English Indicator Guide & Financial Health")
+    col_g1, col_g2, col_g3 = st.columns(3)
+    with col_g1:
+      st.info(
+          "💰 **Capital Tied Up:** The physical cash value of goods sitting in"
+          " your shop. High capital in slow items = trapped cash."
+      )
+    with col_g2:
+      st.success(
+          "📈 **Projected Gross Profit:** Expected cash return on your current"
+          " stock after accounting for future demand growth (+% slider)."
+      )
+    with col_g3:
+      st.warning(
+          "🚨 **Risk Flags:** Items flagged with Loss, Stockout Risk, or Capital"
+          " Drain where you are actively losing money or sales."
+      )
 
     st.markdown("---")
 
     # ---------------------------------------------------------
-    # 2. EXECUTIVE DASHBOARD & PROFIT/LOSS DIAGNOSTICS
+    # 2. EXECUTIVE DASHBOARD & PROFIT/LOSS METRICS
     # ---------------------------------------------------------
     st.markdown("### 📊 Executive Command Centre & Profit/Loss Insights")
     risk_items_count = len(
-        df_analysis[df_analysis["AI_Business_Remark"].str.contains("LOSS|RISK|DRAIN", case=False)]
+        df_analysis[
+            df_analysis["AI_Business_Remark"].str.contains(
+                "LOSS|RISK|DRAIN", case=False
+            )
+        ]
     )
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Stock Capital", f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}")
+    col1.metric(
+        "Total Stock Capital", f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}"
+    )
     col2.metric(
         "Projected Gross Profit",
         f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
-        delta=f"+{sales_growth_slider}% Future Forecast",
+        delta=f"+{sales_growth_slider}% Forecast",
     )
     col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
     col4.metric("⚠️ Profit Leaks & Risks", risk_items_count)
@@ -287,105 +297,126 @@ if sales_file and stock_file:
 
     st.markdown("---")
 
-    # ---------------------------------------------------------
-    # 3. HISTORICAL MARKET INCIDENT INTELLIGENCE
+
+      # ---------------------------------------------------------
+    # 3. HISTORICAL MARKET INTELLIGENCE & INCIDENTS
     # ---------------------------------------------------------
     st.markdown(
         "📜 **Historical Market Insights & Retail Incident Intelligence**"
     )
-    st.info("""
-        * **Retail Trend Alert (Based on Past Market Cycles):** During festive quarters and transport fare hikes in Ghana, demand for bulk staples (like rice, oil, and canned goods) spikes by 35-50% within 14 days. 
-        * **Historical Lesson:** Shops that failed to calculate their *Reorder Points* early experienced severe stockouts, losing up to 40% of peak season revenue to competitors. Your app has automatically factored safety buffers to prevent this incident from repeating in your business.
-        """)
+    st.info(
+        "* **Market Incident Lesson (Ghana Retail Cycles):** During festive"
+        " quarters and transport price adjustments, demand for essential staples"
+        " surges by up to 40%. Retailers who ignored their *Reorder Points* in"
+        " past seasons ran out of stock within 7 days, losing thousands in"
+        " revenue to competitors. Your app calculates safety buffers here to"
+        " prevent this exact incident."
+    )
 
     st.markdown("---")
 
     # ---------------------------------------------------------
-    # 4. INTERACTIVE AI CSV QUERY & SCENARIO ENGINE
+    # 4. INTERACTIVE AI CSV QUERY & SCENARIO ADVISOR
     # ---------------------------------------------------------
     st.markdown("### 💬 Interactive AI Business Query & Scenario Advisor")
     st.markdown(
-        "Ask questions about your data or test market scenarios below to get"
-        " instant algorithmic decisions:"
+        "Select a question below to let the machine learning algorithms analyze"
+        " your data in real-time:"
     )
 
     query_option = st.selectbox(
         "Choose an AI Business Query or Scenario:",
         [
             "Select a question...",
-            "Which items are currently draining my profits or causing losses?",
-            "What items should I restock right now to prevent losing customers?",
-            "Which products generate 80% of my revenue (Class A)?",
-            "How much total capital is locked up in slow-moving inventory?",
-            "Simulate a sudden 30% surge in customer demand across all items",
+            "Which items are currently causing losses or profit drains?",
+            "What items need urgent restocking right now?",
+            "Which products drive 80% of my revenue (Class A)?",
+            "How much total capital is trapped in slow-moving inventory?",
+            "Simulate a 30% surge in customer demand across all items",
         ],
     )
 
     if query_option != "Select a question...":
-      st.markdown("#### 🤖 AI Decision & Real-Time Scenario Analysis:")
-      if "draining my profits" in query_option:
+      st.markdown("#### 🤖 Real-Time Algorithmic Decision & Comparison:")
+      if "causing losses or profit drains" in query_option:
         bad_items = df_analysis[
             df_analysis["AI_Business_Remark"].str.contains(
-                "LOSS|DRAIN", case=False
+                "LOSS|DRAIN|RISK", case=False
             )
         ]
         if not bad_items.empty:
           st.error(
-              "Found items causing capital drain or margin losses:"
+              "Found items requiring immediate management action to protect"
+              " profits:"
           )
           st.dataframe(
-              bad_items[["ItemName", "CurrentStock", "CostPrice", "SellingPrice", "AI_Business_Remark"]],
+              bad_items[[
+                  "ItemName",
+                  "CurrentStock",
+                  "CostPrice",
+                  "SellingPrice",
+                  "AI_Business_Remark",
+              ]],
               use_container_width=True,
           )
         else:
           st.success(
-              "Fantastic news! No items are currently triggering loss or dead"
-              " stock drain alerts."
+              "Outstanding! No loss alerts or capital drains detected in your"
+              " current inventory dataset."
           )
 
-      elif "restock right now" in query_option:
+      elif "restocking right now" in query_option:
         restock_items = df_analysis[
             df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
         ]
         if not restock_items.empty:
           st.warning(
-              "The following items have crossed their Reorder Point and need"
-              " immediate replenishment:"
+              "These items have crossed their calculated Reorder Point:"
           )
           st.dataframe(
-              restock_items[["ItemName", "CurrentStock", "ReorderPoint", "DaysLeft", "StockoutDate"]],
+              restock_items[[
+                  "ItemName",
+                  "CurrentStock",
+                  "ReorderPoint",
+                  "DaysLeft",
+                  "StockoutDate",
+              ]],
               use_container_width=True,
           )
         else:
           st.success(
-              "All inventory items are currently above safe replenishment"
-              " thresholds!"
+              "All items are safely above their reorder thresholds right now!"
           )
 
       elif "80% of my revenue" in query_option:
         class_a = df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
-        st.success(
-            "These are your core revenue drivers (Class A Pareto items). Protect"
-            " these from ever running out:"
-        )
+        st.success("Your core profit drivers (Class A Pareto items):")
         st.dataframe(
-            class_a[["ItemName", "TotalRevenue", "CurrentStock", "SimulatedVelocity"]],
+            class_a[[
+                "ItemName",
+                "TotalRevenue",
+                "CurrentStock",
+                "SimulatedVelocity",
+            ]],
             use_container_width=True,
         )
 
-      elif "capital is locked up" in query_option:
-        total_tied = df_analysis["CapitalTiedUp"].sum()
+      elif "trapped in slow-moving" in query_option:
         dead_tied = df_analysis[
             df_analysis["AI_Business_Remark"].str.contains("DRAIN", case=False)
         ]["CapitalTiedUp"].sum()
         st.info(
-            f"**Total Capital in Stock:** GHS {total_tied:,.2f} | **Capital Trapped in Slow/Dead Stock:** GHS {dead_tied:,.2f}. Consider running promotions on trapped items to recover cash."
+            f"**Capital Trapped in Slow/Dead Stock:** GHS {dead_tied:,.2f}."
+            " Running clearance discounts on these items will free up cash for"
+            " fast sellers."
         )
 
       elif "30% surge" in query_option:
         surge_rev = df_analysis["TotalPotentialRevenue"].sum() * 1.3
         st.success(
-            f"📈 **Scenario Simulation Results:** If customer demand surges by 30%, your projected potential revenue scales to **GHS {surge_rev:,.2f}**. Ensure your Class A safety stocks are fully funded to handle this volume!"
+            f"📈 **Demand Surge Scenario:** If customer purchases jump by 30%,"
+            " your potential revenue scales to **GHS {surge_rev:,.2f}**. Ensure"
+            " your safety buffers are active!"
         )
 
     st.markdown("---")
@@ -398,7 +429,7 @@ if sales_file and stock_file:
     )
 
     def style_remarks(val):
-      if "LOSS" in str(val) or "RISK" in str(val):
+      if "LOSS" in str(val) or "CRITICAL" in str(val):
         return "background-color: #ffcccc; color: #900; font-weight: bold;"
       elif "DRAIN" in str(val):
         return "background-color: #ffe599; color: #b45f06; font-weight: bold;"
