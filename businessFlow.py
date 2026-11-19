@@ -14,6 +14,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("businessFlow")
 
 RECOVERY_TOKEN_TTL_MINUTES = 2
+DEVELOPER_COMPANY = "Roggers Enterprises Limited | Ghana"
+DEVELOPER_EMAIL = "koffieroggers@gmail.com"
+DEVELOPER_HANDLE = "ROG3RS"
+DEVELOPER_GITHUB = "Roggers-dev"
 
 st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
@@ -639,6 +643,40 @@ def reset_password_with_token(token: str, new_password: str) -> tuple[bool, str]
         return False, f"Password reset failed: {exc}"
 
 
+def admin_reset_user_password(
+    target_user_id: int, new_password: str, actor_role: str, actor: str
+) -> tuple[bool, str]:
+    if actor_role != "admin":
+        return False, "Only administrators can reset user passwords."
+    if len(new_password or "") < 6:
+        return False, "New password must be at least 6 characters."
+
+    new_hash = hash_password(new_password)
+
+    def _op(cur):
+        cur.execute(
+            """
+            UPDATE users
+            SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
+            WHERE id = %s
+            RETURNING username;
+            """,
+            (new_hash, int(target_user_id)),
+        )
+        return cur.fetchone()
+
+    try:
+        updated = run_write_tx(_op)
+        if not updated:
+            return False, "User not found."
+        target_name = updated.get("username", "unknown")
+        log_audit(actor, "ADMIN_PASSWORD_RESET", f"Reset password for @{target_name}")
+        return True, f"Password reset for @{target_name}."
+    except Exception as exc:
+        logger.exception("Admin password reset failed for user %s", target_user_id)
+        return False, f"Failed to reset password: {exc}"
+
+
 def fetch_all_users() -> pd.DataFrame:
     try:
         return run_read_query(
@@ -937,11 +975,46 @@ def fetch_audit_logs(limit: int = 100) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 6. AUTHENTICATION & PASSWORD RECOVERY UI
+# 6. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
+# ==============================================================================
+def _copyright_span() -> str:
+    curr_year = date.today().year
+    return "2025" if curr_year <= 2025 else f"2025–{curr_year}"
+
+
+def render_developer_footer():
+    st.divider()
+    st.caption(
+        f"© {_copyright_span()} **{DEVELOPER_COMPANY}** • "
+        f"Contact: `{DEVELOPER_EMAIL}` • Dev: **{DEVELOPER_HANDLE}** (`@{DEVELOPER_GITHUB}`) • "
+        "All rights reserved."
+    )
+
+
+def maybe_show_daily_welcome(user: dict):
+    """Show a daily welcome banner once per calendar day per signed-in user."""
+    today_str = date.today().isoformat()
+    uname = str(user.get("username") or "user").lower()
+    seen_key = f"daily_welcome_shown_{uname}"
+    if st.session_state.get(seen_key) != today_str:
+        st.session_state[seen_key] = today_str
+        display_name = user.get("full_name") or user.get("username") or "Team Member"
+        role_label = str(user.get("role") or "staff").capitalize()
+        st.success(
+            f"Welcome back, **{display_name}** (`@{uname}` • {role_label})! "
+            f"Wishing you a smooth and productive day on {date.today().strftime('%A, %B %d, %Y')}."
+        )
+
+
+# ==============================================================================
+# 7. AUTHENTICATION & PASSWORD RECOVERY UI
 # ==============================================================================
 def render_auth_screen():
     st.title("Enterprise AI Inventory & BI Command Centre")
-    st.caption("Sign in, register a staff account, or recover a forgotten password.")
+    st.caption(
+        f"{DEVELOPER_COMPANY} • {DEVELOPER_EMAIL} • "
+        "Sign in, register a staff account, or recover a forgotten password."
+    )
 
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
@@ -1016,9 +1089,11 @@ def render_auth_screen():
                         else:
                             st.error(msg)
 
+        render_developer_footer()
+
 
 # ==============================================================================
-# 7. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
+# 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
 # ==============================================================================
 def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
     st.subheader("Executive KPIs & Alerts")
@@ -1313,24 +1388,50 @@ def render_admin_tab(user: dict):
             for _, r in users_df.iterrows()
         }
         if user_map:
-            with st.form("manage_user_form"):
-                target_label = st.selectbox("Select User to Manage", list(user_map.keys()))
-                new_role = st.selectbox("Assign Role", ["staff", "admin"])
-                new_active = st.checkbox("Active Account", value=True)
-                apply_btn = st.form_submit_button("Save User Role & Status", type="primary")
-                if apply_btn:
-                    ok, msg = update_user_role_or_status(
-                        user_id=user_map[target_label],
-                        role=new_role,
-                        is_active=new_active,
-                        actor_role=user.get("role", "staff"),
-                        actor=user["username"],
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
+            col_role, col_reset = st.columns(2)
+
+            with col_role:
+                st.markdown("##### Role & Account Status")
+                with st.form("manage_user_form"):
+                    target_label = st.selectbox("Select User to Manage", list(user_map.keys()), key="role_target_user")
+                    new_role = st.selectbox("Assign Role", ["staff", "admin"])
+                    new_active = st.checkbox("Active Account", value=True)
+                    apply_btn = st.form_submit_button("Save User Role & Status", type="primary", use_container_width=True)
+                    if apply_btn:
+                        ok, msg = update_user_role_or_status(
+                            user_id=user_map[target_label],
+                            role=new_role,
+                            is_active=new_active,
+                            actor_role=user.get("role", "staff"),
+                            actor=user["username"],
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+            with col_reset:
+                st.markdown("##### Reset User Password")
+                with st.form("admin_reset_password_form", clear_on_submit=True):
+                    reset_target_label = st.selectbox("Select User", list(user_map.keys()), key="reset_target_user")
+                    temp_pw = st.text_input("New / Temporary Password", type="password", placeholder="Min 6 characters")
+                    confirm_temp_pw = st.text_input("Confirm Password", type="password")
+                    reset_user_btn = st.form_submit_button("Reset Password", use_container_width=True)
+                    if reset_user_btn:
+                        if temp_pw != confirm_temp_pw:
+                            st.error("Passwords do not match.")
+                        else:
+                            ok, msg = admin_reset_user_password(
+                                target_user_id=user_map[reset_target_label],
+                                new_password=temp_pw,
+                                actor_role=user.get("role", "staff"),
+                                actor=user["username"],
+                            )
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
     else:
         st.info("No users found.")
 
@@ -1372,7 +1473,15 @@ def render_main_app(user: dict):
             st.session_state.pop("auth_user", None)
             st.rerun()
 
+        st.divider()
+        st.caption(
+            f"**{DEVELOPER_COMPANY}**\n\n"
+            f"`{DEVELOPER_EMAIL}`\n\n"
+            f"© {_copyright_span()} {DEVELOPER_COMPANY}"
+        )
+
     st.title("Enterprise AI Inventory & BI Command Centre")
+    maybe_show_daily_welcome(user)
 
     products_df = fetch_products()
     tx_df = fetch_transactions(days=int(days_window))
@@ -1399,9 +1508,11 @@ def render_main_app(user: dict):
         with tabs[4]:
             render_admin_tab(user)
 
+    render_developer_footer()
+
 
 # ==============================================================================
-# 8. ENTRY POINT
+# 9. ENTRY POINT
 # ==============================================================================
 def main():
     try:
