@@ -1,12 +1,9 @@
-import csv
 import hashlib
 import io
 import logging
-import math
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import psycopg2
@@ -19,8 +16,6 @@ logger = logging.getLogger("businessFlow")
 RECOVERY_TOKEN_TTL_MINUTES = 2
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "Admin@1234"
-CSV_CHUNK_SIZE = 5000
-DB_BATCH_PAGE_SIZE = 1000
 
 DEVELOPER_COMPANY = "Roggers Enterprises Limited | Ghana"
 DEVELOPER_EMAIL = "koffieroggers@gmail.com"
@@ -31,90 +26,46 @@ st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="expanded",
 )
 
 
 # ==============================================================================
-# 1. RESPONSIVE UI STYLING (ALL DEVICES: DESKTOP, TABLET, MOBILE)
+# 1. BULLETPROOF DATABASE CONNECTION & RETRY ENGINE
 # ==============================================================================
-def inject_responsive_styles():
-    st.markdown(
-        """
-        <style>
-        .block-container {
-            padding-top: 1.25rem;
-            padding-bottom: 2rem;
-            max-width: 100%;
-        }
-        div[data-testid="stMetric"] {
-            border: 1px solid rgba(128, 128, 128, 0.22);
-            border-radius: 10px;
-            padding: 0.65rem 0.85rem;
-        }
-        div[data-testid="stDataFrame"] {
-            width: 100%;
-        }
-        @media (max-width: 768px) {
-            .block-container {
-                padding-top: 0.8rem;
-                padding-left: 0.65rem;
-                padding-right: 0.65rem;
-            }
-            h1 {
-                font-size: 1.45rem !important;
-                line-height: 1.25 !important;
-            }
-            h2, h3 {
-                font-size: 1.15rem !important;
-            }
-            div[data-testid="stMetricValue"] {
-                font-size: 1.25rem !important;
-            }
-            button[kind="primary"], button[kind="secondary"], .stDownloadButton > button {
-                width: 100% !important;
-                min-height: 42px;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ==============================================================================
-# 2. FAST DATABASE CONNECTION & QUERY ENGINE
-# ==============================================================================
-@st.cache_resource
-def _get_normalized_neon_url() -> str:
+def get_neon_url() -> str:
+    """Resolve the Neon Postgres connection URL safely from Streamlit secrets."""
     try:
         if "neon" in st.secrets and "database_url" in st.secrets["neon"]:
             url = str(st.secrets["neon"]["database_url"]).strip()
-        elif "database_url" in st.secrets:
+            if url:
+                return url
+        if "database_url" in st.secrets:
             url = str(st.secrets["database_url"]).strip()
-        else:
-            url = ""
+            if url:
+                return url
     except Exception as exc:
         raise RuntimeError(f"Unable to read Streamlit secrets: {exc}") from exc
 
-    if not url:
-        raise RuntimeError(
-            "Missing Neon connection string. Set [neon] database_url in Streamlit Secrets."
-        )
+    raise RuntimeError(
+        "Missing Neon connection string. Set [neon] database_url in Streamlit Secrets."
+    )
 
-    cleaned = url
+
+def _normalize_neon_url(url: str) -> str:
+    cleaned = url.strip()
     if "sslmode=" not in cleaned:
         sep = "&" if "?" in cleaned else "?"
         cleaned = f"{cleaned}{sep}sslmode=require"
     if "connect_timeout=" not in cleaned:
         sep = "&" if "?" in cleaned else "?"
-        cleaned = f"{cleaned}{sep}connect_timeout=8"
+        cleaned = f"{cleaned}{sep}connect_timeout=10"
     return cleaned
 
 
-def open_connection(retries: int = 1):
-    """Open a Postgres connection quickly with minimal retry overhead."""
-    url = _get_normalized_neon_url()
+def open_connection(retries: int = 2):
+    """Open a Postgres connection with retry support for transient Neon cold-starts."""
+    url = _normalize_neon_url(get_neon_url())
     last_exc = None
     for attempt in range(retries + 1):
         try:
@@ -126,9 +77,10 @@ def open_connection(retries: int = 1):
 
 
 def run_read_query(sql: str, params: tuple | list | None = None) -> pd.DataFrame:
+    """Execute a read query safely and always close the connection."""
     conn = None
     try:
-        conn = open_connection(retries=1)
+        conn = open_connection(retries=2)
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
             rows = cur.fetchall()
@@ -144,6 +96,7 @@ def run_read_query(sql: str, params: tuple | list | None = None) -> pd.DataFrame
 
 
 def run_write_tx(fn):
+    """Execute a transactional write callback with automatic commit/rollback and retry on disconnect."""
     last_exc = None
     for attempt in range(2):
         conn = None
@@ -166,6 +119,7 @@ def run_write_tx(fn):
 
 
 def _try_step(cur, sql: str, params: tuple | list | None = None, step_name: str = "step"):
+    """Run a single DDL/DML statement inside a SAVEPOINT so one legacy quirk doesn't abort the tx."""
     sp = "sp_schema_guard"
     cur.execute(f"SAVEPOINT {sp};")
     try:
@@ -184,20 +138,7 @@ def safe_float(val, default: float = 0.0) -> float:
     try:
         if val is None or pd.isna(val):
             return default
-        if isinstance(val, str):
-            cleaned = (
-                val.replace(",", "")
-                .replace("GHS", "")
-                .replace("₵", "")
-                .replace("$", "")
-                .strip()
-            )
-            if not cleaned:
-                return default
-            num = float(cleaned)
-        else:
-            num = float(val)
-        return default if (math.isnan(num) or math.isinf(num)) else num
+        return float(val)
     except Exception:
         return default
 
@@ -206,220 +147,13 @@ def safe_int(val, default: int = 0) -> int:
     try:
         if val is None or pd.isna(val):
             return default
-        if isinstance(val, str):
-            cleaned = val.replace(",", "").strip()
-            if not cleaned:
-                return default
-            num = float(cleaned)
-        else:
-            num = float(val)
-        if math.isnan(num) or math.isinf(num):
-            return default
-        return int(num)
+        return int(float(val))
     except Exception:
         return default
 
 
-def invalidate_data_caches():
-    fetch_products_cached.clear()
-    fetch_transactions_cached.clear()
-    fetch_all_users_cached.clear()
-    fetch_audit_logs_cached.clear()
-
-
 # ==============================================================================
-# 3. UNIVERSAL CSV & EXCEL (MULTI-LAYER / MULTI-COLUMN / CHUNKED) PARSER
-# ==============================================================================
-def _read_raw_bytes(uploaded_file) -> bytes:
-    try:
-        if hasattr(uploaded_file, "seek"):
-            uploaded_file.seek(0)
-        raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-        if isinstance(raw, str):
-            return raw.encode("utf-8", errors="replace")
-        return bytes(raw or b"")
-    except Exception as exc:
-        raise ValueError(f"Unable to read uploaded file: {exc}") from exc
-
-
-def _decode_csv_sample(raw_bytes: bytes) -> tuple[str, str]:
-    text = None
-    used_enc = "utf-8"
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            text = raw_bytes.decode(enc)
-            used_enc = enc
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = raw_bytes.decode("utf-8", errors="replace")
-
-    sample_lines = "\n".join(text.splitlines()[:25])
-    sep = ","
-    try:
-        dialect = csv.Sniffer().sniff(sample_lines, delimiters=[",", ";", "\t", "|"])
-        if dialect and dialect.delimiter:
-            sep = dialect.delimiter
-    except Exception:
-        counts = {d: sample_lines.count(d) for d in (",", ";", "\t", "|")}
-        best_sep = max(counts, key=counts.get)
-        if counts[best_sep] > 0:
-            sep = best_sep
-    return used_enc, sep
-
-
-def _flatten_multi_layer_columns(df: pd.DataFrame) -> pd.DataFrame:
-    seen: dict[str, int] = {}
-    new_cols: list[str] = []
-
-    for idx, col in enumerate(df.columns):
-        if isinstance(col, tuple):
-            parts = []
-            for part in col:
-                p_str = "" if part is None or pd.isna(part) else str(part).strip()
-                if not p_str or p_str.lower().startswith("unnamed"):
-                    continue
-                if not parts or parts[-1].lower() != p_str.lower():
-                    parts.append(p_str)
-            base_name = " / ".join(parts) if parts else f"col_{idx + 1}"
-        else:
-            c_str = "" if col is None or pd.isna(col) else str(col).strip()
-            base_name = c_str if (c_str and not c_str.lower().startswith("unnamed")) else f"col_{idx + 1}"
-
-        key = base_name.lower()
-        if key in seen:
-            seen[key] += 1
-            unique_name = f"{base_name}_{seen[key]}"
-        else:
-            seen[key] = 1
-            unique_name = base_name
-        new_cols.append(unique_name)
-
-    df.columns = new_cols
-    return df
-
-
-def list_excel_sheets(uploaded_file) -> list[str]:
-    raw_bytes = _read_raw_bytes(uploaded_file)
-    try:
-        xl = pd.ExcelFile(io.BytesIO(raw_bytes))
-        return list(xl.sheet_names)
-    except Exception as exc:
-        raise ValueError(f"Could not inspect Excel workbook sheets: {exc}") from exc
-
-
-def parse_tabular_chunks(
-    uploaded_file,
-    header_layers: int = 1,
-    sheet_name: str | int | None = 0,
-    chunksize: int = CSV_CHUNK_SIZE,
-) -> tuple[list[pd.DataFrame], dict]:
-    """
-    Parse CSV or Excel (.xlsx / .xls) with 1–3 header layers and many columns
-    into cleaned chunks.
-    """
-    raw_bytes = _read_raw_bytes(uploaded_file)
-    if not raw_bytes:
-        raise ValueError("Uploaded file is empty.")
-
-    fname = str(getattr(uploaded_file, "name", "") or "").lower()
-    is_excel = fname.endswith(".xlsx") or fname.endswith(".xls")
-    layers = max(1, min(safe_int(header_layers, 1), 3))
-    header_arg: int | list[int] = 0 if layers == 1 else list(range(layers))
-
-    chunks: list[pd.DataFrame] = []
-    total_rows = 0
-
-    if is_excel:
-        try:
-            full_df = pd.read_excel(
-                io.BytesIO(raw_bytes),
-                sheet_name=0 if sheet_name is None else sheet_name,
-                header=header_arg,
-            )
-            if isinstance(full_df, dict):
-                full_df = next(iter(full_df.values()), pd.DataFrame())
-            if full_df is None or full_df.empty:
-                raise ValueError("Selected Excel sheet is empty.")
-            full_df = _flatten_multi_layer_columns(full_df.copy()).dropna(how="all")
-            full_df = full_df.replace([np.inf, -np.inf], np.nan)
-            if full_df.empty:
-                raise ValueError("No valid data rows found in Excel sheet.")
-
-            step = max(500, safe_int(chunksize, CSV_CHUNK_SIZE))
-            for start in range(0, len(full_df), step):
-                part = full_df.iloc[start : start + step].copy()
-                if not part.empty:
-                    chunks.append(part)
-                    total_rows += len(part)
-
-            meta = {
-                "format": "Excel",
-                "sheet": sheet_name,
-                "header_layers": layers,
-                "total_rows": total_rows,
-                "total_columns": len(chunks[0].columns),
-                "chunk_count": len(chunks),
-            }
-            return chunks, meta
-        except Exception as exc:
-            raise ValueError(f"Failed parsing Excel file: {exc}") from exc
-
-    # CSV path
-    encoding, sep = _decode_csv_sample(raw_bytes)
-    try:
-        reader = pd.read_csv(
-            io.BytesIO(raw_bytes),
-            sep=sep,
-            encoding=encoding,
-            header=header_arg,
-            chunksize=max(500, safe_int(chunksize, CSV_CHUNK_SIZE)),
-            low_memory=False,
-            on_bad_lines="skip",
-        )
-        for chunk in reader:
-            if chunk is None or chunk.empty:
-                continue
-            cleaned = _flatten_multi_layer_columns(chunk.copy()).dropna(how="all")
-            if cleaned.empty:
-                continue
-            cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
-            total_rows += len(cleaned)
-            chunks.append(cleaned)
-    except Exception as exc:
-        raise ValueError(f"Failed parsing CSV (encoding={encoding}, sep='{sep}'): {exc}") from exc
-
-    if not chunks:
-        raise ValueError("No valid data rows found in CSV file.")
-
-    meta = {
-        "format": f"CSV ({encoding}, sep='{sep}')",
-        "sheet": None,
-        "header_layers": layers,
-        "total_rows": total_rows,
-        "total_columns": len(chunks[0].columns),
-        "chunk_count": len(chunks),
-    }
-    return chunks, meta
-
-
-def _resolve_mapped_column(columns: list[str], selected_col: str | None, aliases: tuple[str, ...]) -> str | None:
-    if selected_col and selected_col != "<Auto / None>" and selected_col in columns:
-        return selected_col
-    norm_map = {str(c).strip().lower(): c for c in columns}
-    for alias in aliases:
-        if alias in norm_map:
-            return norm_map[alias]
-    for col in columns:
-        c_low = str(col).strip().lower()
-        for alias in aliases:
-            if c_low.endswith(f" / {alias}") or c_low.endswith(f"_{alias}") or f" {alias}" in c_low:
-                return col
-    return None
-
-# ==============================================================================
-# 4. PASSWORD HASHING & AUTHENTICATION (FIXED PASSWORD PERSISTENCE)
+# 2. PASSWORD HASHING & AUTHENTICATION
 # ==============================================================================
 def hash_password(password: str, salt: str | None = None) -> str:
     if salt is None:
@@ -450,7 +184,7 @@ def verify_password(password: str, stored_hash: str | None) -> bool:
 
 
 # ==============================================================================
-# 5. SCHEMA INITIALIZATION (RUNS ONCE PER PROCESS) & AUDIT LOGGING
+# 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
 # ==============================================================================
 def _get_table_columns(cur, table_name: str) -> set[str]:
     try:
@@ -469,6 +203,7 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
 
 
 def _relax_extra_not_null_columns(cur, table_name: str, managed_cols: set[str]):
+    """Allow legacy extra columns without defaults to accept NULLs so inserts never fail."""
     try:
         cur.execute(
             """
@@ -512,17 +247,84 @@ def _heal_users_table(cur):
     )
 
     existing_cols = _get_table_columns(cur, "users")
+
     if "username" not in existing_cols:
         _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);", step_name="add_username")
+        for candidate in ("email", "user_name", "login", "name"):
+            if candidate in existing_cols:
+                _try_step(
+                    cur,
+                    f"UPDATE users SET username = LOWER(TRIM({candidate}::text)) WHERE (username IS NULL OR TRIM(username) = '') AND {candidate} IS NOT NULL AND TRIM({candidate}::text) <> '';",
+                    step_name=f"backfill_username_from_{candidate}",
+                )
         if "id" in existing_cols:
             _try_step(
                 cur,
                 "UPDATE users SET username = 'user_' || id::text WHERE username IS NULL OR TRIM(username) = '';",
                 step_name="backfill_username_from_id",
             )
+        else:
+            _try_step(
+                cur,
+                "UPDATE users SET username = 'staff_user' WHERE username IS NULL OR TRIM(username) = '';",
+                step_name="backfill_username_default",
+            )
+
+    if "id" in existing_cols:
+        _try_step(
+            cur,
+            """
+            WITH ranked AS (
+                SELECT
+                    id,
+                    username,
+                    ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(username)) ORDER BY id ASC) AS rn
+                FROM users
+                WHERE username IS NOT NULL AND TRIM(username) <> ''
+            )
+            UPDATE users u
+            SET username = LEFT(u.username, 80) || '_' || u.id::text
+            FROM ranked r
+            WHERE u.id = r.id AND r.rn > 1;
+            """,
+            step_name="deduplicate_usernames",
+        )
+
+    _try_step(
+        cur,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relname = 'users' AND c.contype = 'u'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE tablename = 'users' AND indexdef ILIKE '%UNIQUE%username%'
+            ) THEN
+                ALTER TABLE users ADD CONSTRAINT users_username_unique UNIQUE (username);
+            END IF;
+        EXCEPTION
+            WHEN unique_violation OR duplicate_table OR duplicate_object THEN
+                NULL;
+        END$$;
+        """,
+        step_name="add_username_unique_safe",
+    )
+
+    _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;", step_name="add_password_hash")
+    for pw_candidate in ("password", "password_digest", "pass_hash", "passwd"):
+        if pw_candidate in existing_cols:
+            _try_step(
+                cur,
+                f"UPDATE users SET password_hash = {pw_candidate}::text WHERE (password_hash IS NULL OR TRIM(password_hash) = '') AND {pw_candidate} IS NOT NULL AND TRIM({pw_candidate}::text) <> '';",
+                step_name=f"backfill_password_hash_from_{pw_candidate}",
+            )
 
     for ddl, label in [
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;", "add_password_hash"),
         ("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';", "add_full_name"),
         ("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'staff';", "add_role"),
         ("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;", "add_is_active"),
@@ -537,10 +339,20 @@ def _heal_users_table(cur):
         "users",
         {"id", "username", "full_name", "role", "password_hash", "is_active", "reset_token", "reset_expires_at", "created_at"},
     )
+
+    _try_step(
+        cur,
+        """
+        UPDATE users
+        SET full_name = username
+        WHERE (full_name IS NULL OR TRIM(full_name) = '' OR full_name = 'User')
+          AND username IS NOT NULL AND TRIM(username) <> '';
+        """,
+        step_name="sync_full_name",
+    )
     _try_step(cur, "UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';", step_name="sync_role")
     _try_step(cur, "UPDATE users SET is_active = TRUE WHERE is_active IS NULL;", step_name="sync_is_active")
 
-    # Only seed default admin if no admin user exists at all
     _try_step(
         cur,
         """
@@ -551,7 +363,7 @@ def _heal_users_table(cur):
         );
         """,
         (hash_password(DEFAULT_ADMIN_PASSWORD),),
-        step_name="seed_default_admin_if_missing",
+        step_name="ensure_admin_account",
     )
 
 
@@ -561,11 +373,11 @@ def _heal_products_table(cur):
         """
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
-            sku VARCHAR(120) UNIQUE NOT NULL,
-            name VARCHAR(250) NOT NULL,
-            category VARCHAR(120) NOT NULL DEFAULT 'General',
-            unit_cost NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
-            selling_price NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+            sku VARCHAR(60) UNIQUE NOT NULL,
+            name VARCHAR(200) NOT NULL,
+            category VARCHAR(100) NOT NULL DEFAULT 'General',
+            unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+            selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
             stock_qty INTEGER NOT NULL DEFAULT 0,
             reorder_level INTEGER NOT NULL DEFAULT 10,
             updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -573,18 +385,39 @@ def _heal_products_table(cur):
         """,
         step_name="create_products",
     )
+    cols = _get_table_columns(cur, "products")
     for ddl, label in [
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(120);", "prod_add_sku"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS name VARCHAR(250) NOT NULL DEFAULT 'Unnamed Item';", "prod_add_name"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(120) NOT NULL DEFAULT 'General';", "prod_add_cat"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(14, 2) NOT NULL DEFAULT 0.00;", "prod_add_cost"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_price NUMERIC(14, 2) NOT NULL DEFAULT 0.00;", "prod_add_price"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(60);", "prod_add_sku"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS name VARCHAR(200) NOT NULL DEFAULT 'Unnamed Item';", "prod_add_name"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(100) NOT NULL DEFAULT 'General';", "prod_add_cat"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_cost"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_price"),
         ("ALTER TABLE products ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;", "prod_add_qty"),
         ("ALTER TABLE products ADD COLUMN IF NOT EXISTS reorder_level INTEGER NOT NULL DEFAULT 10;", "prod_add_reorder"),
         ("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "prod_add_updated"),
     ]:
         _try_step(cur, ddl, step_name=label)
 
+    if "sku" in cols or "id" in cols:
+        _try_step(
+            cur,
+            "UPDATE products SET sku = 'SKU-' || id::text WHERE (sku IS NULL OR TRIM(sku) = '') AND id IS NOT NULL;",
+            step_name="prod_backfill_sku",
+        )
+    for alt_name in ("product_name", "title", "item_name"):
+        if alt_name in cols:
+            _try_step(
+                cur,
+                f"UPDATE products SET name = {alt_name}::text WHERE (name IS NULL OR TRIM(name) = '' OR name = 'Unnamed Item') AND {alt_name} IS NOT NULL;",
+                step_name=f"prod_backfill_name_{alt_name}",
+            )
+    for alt_qty in ("quantity", "qty", "stock"):
+        if alt_qty in cols:
+            _try_step(
+                cur,
+                f"UPDATE products SET stock_qty = COALESCE({alt_qty}::integer, 0) WHERE stock_qty = 0 AND {alt_qty} IS NOT NULL;",
+                step_name=f"prod_backfill_qty_{alt_qty}",
+            )
     _relax_extra_not_null_columns(
         cur,
         "products",
@@ -600,11 +433,11 @@ def _heal_transactions_table(cur):
             id SERIAL PRIMARY KEY,
             tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE',
             product_id INTEGER,
-            sku VARCHAR(120) NOT NULL DEFAULT '',
-            product_name VARCHAR(250) NOT NULL DEFAULT '',
+            sku VARCHAR(60) NOT NULL DEFAULT '',
+            product_name VARCHAR(200) NOT NULL DEFAULT '',
             quantity INTEGER NOT NULL DEFAULT 0,
-            unit_price NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
-            total_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+            unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+            total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
             recorded_by VARCHAR(100) NOT NULL DEFAULT 'system',
             notes TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -612,20 +445,49 @@ def _heal_transactions_table(cur):
         """,
         step_name="create_transactions",
     )
+    cols = _get_table_columns(cur, "transactions")
     for ddl, label in [
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE';", "tx_add_tx_type"),
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_id INTEGER;", "tx_add_product_id"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sku VARCHAR(120) NOT NULL DEFAULT '';", "tx_add_sku"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_name VARCHAR(250) NOT NULL DEFAULT '';", "tx_add_prod_name"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sku VARCHAR(60) NOT NULL DEFAULT '';", "tx_add_sku"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_name VARCHAR(200) NOT NULL DEFAULT '';", "tx_add_prod_name"),
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;", "tx_add_qty"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS unit_price NUMERIC(14, 2) NOT NULL DEFAULT 0.00;", "tx_add_unit_price"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS total_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00;", "tx_add_total"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_unit_price"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_total"),
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recorded_by VARCHAR(100) NOT NULL DEFAULT 'system';", "tx_add_recorded_by"),
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS notes TEXT;", "tx_add_notes"),
         ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "tx_add_created_at"),
     ]:
         _try_step(cur, ddl, step_name=label)
 
+    for alt_type in ("type", "transaction_type", "movement_type"):
+        if alt_type in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET tx_type = UPPER(TRIM({alt_type}::text)) WHERE (tx_type IS NULL OR TRIM(tx_type) = '') AND {alt_type} IS NOT NULL;",
+                step_name=f"tx_backfill_type_{alt_type}",
+            )
+    for alt_qty in ("qty", "stock_qty"):
+        if alt_qty in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET quantity = COALESCE({alt_qty}::integer, 0) WHERE quantity = 0 AND {alt_qty} IS NOT NULL;",
+                step_name=f"tx_backfill_qty_{alt_qty}",
+            )
+    for alt_amt in ("amount", "total", "price"):
+        if alt_amt in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET total_amount = COALESCE({alt_amt}::numeric, 0.00) WHERE total_amount = 0 AND {alt_amt} IS NOT NULL;",
+                step_name=f"tx_backfill_amt_{alt_amt}",
+            )
+    for alt_actor in ("user", "username", "created_by", "actor"):
+        if alt_actor in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET recorded_by = {alt_actor}::text WHERE (recorded_by IS NULL OR TRIM(recorded_by) = '' OR recorded_by = 'system') AND {alt_actor} IS NOT NULL;",
+                step_name=f"tx_backfill_actor_{alt_actor}",
+            )
     _relax_extra_not_null_columns(
         cur,
         "transactions",
@@ -665,7 +527,8 @@ def _apply_schema_and_seed(cur):
 
     cur.execute("SELECT COUNT(*) AS cnt FROM products;")
     prow = cur.fetchone()
-    if safe_int(prow["cnt"] if prow else 0) == 0:
+    prod_count = safe_int(prow["cnt"] if prow else 0)
+    if prod_count == 0:
         starter_products = [
             ("SKU-1001", "Wireless Barcode Scanner", "Hardware", 180.00, 260.00, 24, 8),
             ("SKU-1002", "Thermal Receipt Paper (Roll)", "Supplies", 6.50, 12.00, 120, 30),
@@ -674,15 +537,14 @@ def _apply_schema_and_seed(cur):
         ]
         _try_step(cur, "SAVEPOINT sp_seed_prods;", step_name="sp_seed_prods_init")
         try:
-            extras.execute_values(
+            extras.execute_batch(
                 cur,
                 """
                 INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level)
-                VALUES %s
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (sku) DO NOTHING;
                 """,
                 starter_products,
-                page_size=100,
             )
             cur.execute("RELEASE SAVEPOINT sp_seed_prods;")
         except Exception as exc:
@@ -690,8 +552,9 @@ def _apply_schema_and_seed(cur):
             logger.warning("Seed products skipped: %s", exc)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Connecting to database and verifying schema...")
 def init_database_schema() -> bool:
+    """Initialize schema once per process; clear cache automatically on failure."""
     try:
         run_write_tx(_apply_schema_and_seed)
         return True
@@ -701,6 +564,7 @@ def init_database_schema() -> bool:
 
 
 def log_audit(username: str, action: str, details: str = ""):
+    """Best-effort audit logging that never crashes the main user workflow."""
     try:
         clean_actor = (username or "system").strip().lower()[:100]
         clean_action = str(action)[:120]
@@ -708,6 +572,7 @@ def log_audit(username: str, action: str, details: str = ""):
         now_ts = utc_now()
 
         def _op(cur):
+            _heal_audit_logs_table(cur)
             cur.execute(
                 """
                 INSERT INTO audit_logs (username, action, details, created_at)
@@ -717,14 +582,12 @@ def log_audit(username: str, action: str, details: str = ""):
             )
 
         run_write_tx(_op)
-        fetch_audit_logs_cached.clear()
     except Exception as exc:
-        logger.warning("Audit log write skipped: %s", exc)
-
-# ==============================================================================
-# 6. USER ACCOUNT, CHANGE PASSWORD & RECOVERY OPERATIONS
+        logger.warning("Audit log write skipped: %s", exc)# ==============================================================================
+# 4. USER ACCOUNT, CHANGE PASSWORD & RECOVERY OPERATIONS
 # ==============================================================================
 def register_staff_user(username: str, full_name: str, password: str) -> tuple[bool, str]:
+    """Create a standard 'staff' account. Admin promotion is restricted to admins."""
     clean_user = (username or "").strip().lower()
     clean_name = (full_name or "").strip()
     if len(clean_user) < 3:
@@ -738,6 +601,7 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
     now_ts = utc_now()
 
     def _op(cur):
+        _heal_users_table(cur)
         cur.execute(
             """
             INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
@@ -753,7 +617,6 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
         row = run_write_tx(_op)
         if row is None:
             return False, f"Username '{clean_user}' already exists."
-        fetch_all_users_cached.clear()
         log_audit(clean_user, "STAFF_SIGNUP", "Self-registered with role 'staff'")
         return True, f"Staff account created for @{clean_user}. You can sign in now."
     except Exception as exc:
@@ -761,25 +624,29 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
         return False, f"Error creating account: {exc}"
 
 
-def _ensure_missing_default_admin(password: str) -> dict:
-    """Create default admin ONLY when no admin record exists or its hash is empty/invalid."""
+def _sync_default_admin(password: str) -> dict:
+    """Ensure the default admin row exists, is active, and has a valid PBKDF2 hash."""
     fresh_hash = hash_password(password)
     now_ts = utc_now()
 
     def _op(cur):
+        _heal_users_table(cur)
         cur.execute(
-            "SELECT id, username, full_name, role, password_hash FROM users WHERE LOWER(TRIM(username)) = %s LIMIT 1;",
-            (DEFAULT_ADMIN_USERNAME,),
+            """
+            UPDATE users
+            SET role = 'admin',
+                is_active = TRUE,
+                password_hash = %s,
+                reset_token = NULL,
+                reset_expires_at = NULL
+            WHERE LOWER(TRIM(username)) = %s
+            RETURNING id, username, full_name, role;
+            """,
+            (fresh_hash, DEFAULT_ADMIN_USERNAME),
         )
-        existing = cur.fetchone()
-        if existing:
-            cur.execute(
-                "UPDATE users SET is_active = TRUE, role = COALESCE(NULLIF(role, ''), 'admin') WHERE id = %s RETURNING id, username, full_name, role;",
-                (existing["id"],),
-            )
-            upd = cur.fetchone()
-            return dict(upd) if upd else dict(existing)
-
+        row = cur.fetchone()
+        if row:
+            return dict(row)
         cur.execute(
             """
             INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
@@ -797,12 +664,11 @@ def _ensure_missing_default_admin(password: str) -> dict:
         }
 
     saved = run_write_tx(_op)
-    fetch_all_users_cached.clear()
     return {
         "id": safe_int(saved.get("id"), 1),
         "username": str(saved.get("username") or DEFAULT_ADMIN_USERNAME),
         "full_name": str(saved.get("full_name") or "System Administrator"),
-        "role": str(saved.get("role") or "admin"),
+        "role": "admin",
     }
 
 
@@ -823,10 +689,9 @@ def authenticate_user(username: str, password: str) -> dict | None:
             (clean_user,),
         )
 
-        # Only bootstrap default admin when no admin row exists yet
-        if clean_user == DEFAULT_ADMIN_USERNAME and df.empty and raw_password == DEFAULT_ADMIN_PASSWORD:
-            boot = _ensure_missing_default_admin(raw_password)
-            return boot
+        if clean_user == DEFAULT_ADMIN_USERNAME and raw_password == DEFAULT_ADMIN_PASSWORD:
+            if df.empty or not verify_password(raw_password, df.iloc[0].to_dict().get("password_hash")):
+                return _sync_default_admin(raw_password)
 
         if df.empty:
             return None
@@ -885,9 +750,8 @@ def change_user_password(username: str, current_password: str, new_password: str
             )
 
         run_write_tx(_op)
-        fetch_all_users_cached.clear()
         log_audit(clean_user, "PASSWORD_CHANGED", "Updated password via account settings")
-        return True, "Password changed successfully. Use your new password next time you sign in."
+        return True, "Password changed successfully."
     except Exception as exc:
         logger.exception("Password change failed for %s", clean_user)
         return False, f"Failed to change password: {exc}"
@@ -974,7 +838,6 @@ def reset_password_with_token(token: str, new_password: str) -> tuple[bool, str]
     try:
         ok, msg = run_write_tx(_op)
         if ok:
-            fetch_all_users_cached.clear()
             log_audit("recovery", "PASSWORD_RESET_COMPLETED", "Password reset via recovery token")
         return ok, msg
     except Exception as exc:
@@ -1008,7 +871,6 @@ def admin_reset_user_password(
         updated = run_write_tx(_op)
         if not updated:
             return False, "User not found."
-        fetch_all_users_cached.clear()
         target_name = updated.get("username", "unknown")
         log_audit(actor, "ADMIN_PASSWORD_RESET", f"Reset password for @{target_name}")
         return True, f"Password reset for @{target_name}."
@@ -1017,16 +879,11 @@ def admin_reset_user_password(
         return False, f"Failed to reset password: {exc}"
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_all_users_cached() -> pd.DataFrame:
-    return run_read_query(
-        "SELECT id, username, full_name, role, is_active, created_at FROM users ORDER BY id;"
-    )
-
-
 def fetch_all_users() -> pd.DataFrame:
     try:
-        return fetch_all_users_cached()
+        return run_read_query(
+            "SELECT id, username, full_name, role, is_active, created_at FROM users ORDER BY id;"
+        )
     except Exception as exc:
         st.error(f"Failed to load users: {exc}")
         return pd.DataFrame()
@@ -1056,7 +913,6 @@ def update_user_role_or_status(
         updated = run_write_tx(_op)
         if not updated:
             return False, "User not found."
-        fetch_all_users_cached.clear()
         target_name = updated.get("username", "unknown")
         log_audit(actor, "USER_ROLE_UPDATED", f"Target @{target_name} -> role={role}, active={is_active}")
         return True, f"Updated @{target_name} (Role: {role}, Active: {is_active})."
@@ -1064,54 +920,50 @@ def update_user_role_or_status(
         logger.exception("Failed to update user %s", user_id)
         return False, f"Failed to update user: {exc}"
 
-
 # ==============================================================================
-# 7. CACHED READS & BATCH WRITE OPERATIONS
+# 5. INVENTORY & TRANSACTION OPERATIONS
 # ==============================================================================
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_products_cached() -> pd.DataFrame:
-    df = run_read_query(
-        """
-        SELECT
-            id,
-            sku,
-            name,
-            category,
-            unit_cost,
-            selling_price,
-            stock_qty,
-            reorder_level,
-            updated_at
-        FROM products
-        ORDER BY id DESC;
-        """
-    )
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "id", "sku", "name", "category", "unit_cost", "selling_price",
-                "stock_qty", "reorder_level", "updated_at", "stock_value",
-                "retail_value", "status",
-            ]
-        )
-
-    df["unit_cost"] = df["unit_cost"].apply(safe_float)
-    df["selling_price"] = df["selling_price"].apply(safe_float)
-    df["stock_qty"] = df["stock_qty"].apply(safe_int)
-    df["reorder_level"] = df["reorder_level"].apply(safe_int)
-    df["stock_value"] = df["stock_qty"] * df["unit_cost"]
-    df["retail_value"] = df["stock_qty"] * df["selling_price"]
-    df["status"] = np.where(
-        df["stock_qty"] <= 0,
-        "Out of Stock",
-        np.where(df["stock_qty"] <= df["reorder_level"], "Low Stock", "Healthy"),
-    )
-    return df
-
-
 def fetch_products() -> pd.DataFrame:
     try:
-        return fetch_products_cached()
+        run_write_tx(_heal_products_table)
+        df = run_read_query(
+            """
+            SELECT
+                id,
+                sku,
+                name,
+                category,
+                unit_cost,
+                selling_price,
+                stock_qty,
+                reorder_level,
+                updated_at
+            FROM products
+            ORDER BY id DESC;
+            """
+        )
+        if df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "id", "sku", "name", "category", "unit_cost", "selling_price",
+                    "stock_qty", "reorder_level", "updated_at", "stock_value",
+                    "retail_value", "status",
+                ]
+            )
+
+        df["unit_cost"] = df["unit_cost"].apply(safe_float)
+        df["selling_price"] = df["selling_price"].apply(safe_float)
+        df["stock_qty"] = df["stock_qty"].apply(safe_int)
+        df["reorder_level"] = df["reorder_level"].apply(safe_int)
+        df["stock_value"] = df["stock_qty"] * df["unit_cost"]
+        df["retail_value"] = df["stock_qty"] * df["selling_price"]
+        df["status"] = df.apply(
+            lambda r: "Out of Stock"
+            if r["stock_qty"] <= 0
+            else ("Low Stock" if r["stock_qty"] <= r["reorder_level"] else "Healthy"),
+            axis=1,
+        )
+        return df
     except Exception as exc:
         st.error(f"Failed to load products: {exc}")
         return pd.DataFrame()
@@ -1127,9 +979,9 @@ def add_or_update_product(
     reorder_level: int,
     actor: str,
 ) -> tuple[bool, str]:
-    clean_sku = (sku or "").strip().upper()[:120]
-    clean_name = (name or "").strip()[:250]
-    clean_cat = ((category or "").strip() or "General")[:120]
+    clean_sku = (sku or "").strip().upper()
+    clean_name = (name or "").strip()
+    clean_cat = (category or "").strip() or "General"
     if not clean_sku or not clean_name:
         return False, "SKU and Product Name are required."
 
@@ -1140,6 +992,8 @@ def add_or_update_product(
     now_ts = utc_now()
 
     def _op(cur):
+        _heal_products_table(cur)
+        _heal_transactions_table(cur)
         cur.execute(
             """
             INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level, updated_at)
@@ -1170,96 +1024,11 @@ def add_or_update_product(
 
     try:
         run_write_tx(_op)
-        invalidate_data_caches()
         log_audit(actor, "PRODUCT_UPSERT", f"{clean_sku} ({clean_name}) qty={s_qty}")
         return True, f"Saved product {clean_sku} — {clean_name}."
     except Exception as exc:
         logger.exception("Failed to save product %s", clean_sku)
         return False, f"Failed to save product: {exc}"
-
-
-def bulk_upsert_products_batch(records: list[dict], actor: str) -> tuple[int, list[str]]:
-    if not records:
-        return 0, ["No valid product rows to import."]
-
-    now_ts = utc_now()
-    deduped: dict[str, tuple] = {}
-    errors: list[str] = []
-
-    for i, rec in enumerate(records):
-        sku = str(rec.get("sku") or "").strip().upper()[:120]
-        name = str(rec.get("name") or "").strip()[:250]
-        if not sku or not name:
-            errors.append(f"Record {i + 1}: Missing SKU or Name.")
-            continue
-        cat = (str(rec.get("category") or "General").strip() or "General")[:120]
-        cost = max(0.0, safe_float(rec.get("unit_cost"), 0.0))
-        price = max(0.0, safe_float(rec.get("selling_price"), 0.0))
-        qty = max(0, safe_int(rec.get("stock_qty"), 0))
-        reorder = max(0, safe_int(rec.get("reorder_level"), 10))
-        deduped[sku] = (sku, name, cat, cost, price, qty, reorder, now_ts)
-
-    if not deduped:
-        return 0, errors or ["No valid rows after validation."]
-
-    rows_list = list(deduped.values())
-
-    def _op(cur):
-        extras.execute_values(
-            cur,
-            """
-            INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level, updated_at)
-            VALUES %s
-            ON CONFLICT (sku) DO UPDATE SET
-                name = EXCLUDED.name,
-                category = EXCLUDED.category,
-                unit_cost = EXCLUDED.unit_cost,
-                selling_price = EXCLUDED.selling_price,
-                stock_qty = EXCLUDED.stock_qty,
-                reorder_level = EXCLUDED.reorder_level,
-                updated_at = EXCLUDED.updated_at
-            RETURNING id, sku, name, stock_qty, unit_cost;
-            """,
-            rows_list,
-            page_size=DB_BATCH_PAGE_SIZE,
-        )
-        upserted = cur.fetchall() or []
-        tx_rows = [
-            (
-                "STOCK_IN",
-                safe_int(r.get("id")),
-                str(r.get("sku") or ""),
-                str(r.get("name") or ""),
-                safe_int(r.get("stock_qty")),
-                safe_float(r.get("unit_cost")),
-                round(safe_int(r.get("stock_qty")) * safe_float(r.get("unit_cost")), 2),
-                actor,
-                "Bulk catalog import",
-                now_ts,
-            )
-            for r in upserted
-            if safe_int(r.get("stock_qty")) > 0
-        ]
-        if tx_rows:
-            extras.execute_values(
-                cur,
-                """
-                INSERT INTO transactions (tx_type, product_id, sku, product_name, quantity, unit_price, total_amount, recorded_by, notes, created_at)
-                VALUES %s;
-                """,
-                tx_rows,
-                page_size=DB_BATCH_PAGE_SIZE,
-            )
-        return len(upserted)
-
-    try:
-        imported_count = run_write_tx(_op)
-        invalidate_data_caches()
-        log_audit(actor, "BULK_CATALOG_IMPORT", f"Batch imported/updated {imported_count} SKUs")
-        return safe_int(imported_count), errors
-    except Exception as exc:
-        logger.exception("Batch product import failed")
-        return 0, [f"Batch import error: {exc}"]
 
 
 def record_stock_movement(
@@ -1276,10 +1045,12 @@ def record_stock_movement(
         return False, "Quantity must be greater than zero."
 
     now_ts = utc_now()
-    clean_notes = (notes or "").strip()[:500]
-    clean_sku = (sku_fallback or "").strip().upper()[:120]
+    clean_notes = (notes or "").strip()
+    clean_sku = (sku_fallback or "").strip().upper()
 
     def _op(cur):
+        _heal_products_table(cur)
+        _heal_transactions_table(cur)
         if product_id is not None:
             cur.execute("SELECT * FROM products WHERE id = %s FOR UPDATE;", (int(product_id),))
         else:
@@ -1304,9 +1075,14 @@ def record_stock_movement(
         total_amount = round(qty * unit_price, 2)
 
         cur.execute(
-            "UPDATE products SET stock_qty = %s, updated_at = %s WHERE id = %s;",
+            """
+            UPDATE products
+            SET stock_qty = %s, updated_at = %s
+            WHERE id = %s;
+            """,
             (new_qty, now_ts, pid),
         )
+
         cur.execute(
             """
             INSERT INTO transactions (tx_type, product_id, sku, product_name, quantity, unit_price, total_amount, recorded_by, notes, created_at)
@@ -1330,7 +1106,6 @@ def record_stock_movement(
     try:
         ok, msg = run_write_tx(_op)
         if ok:
-            invalidate_data_caches()
             log_audit(actor, f"TX_{tx_type}", f"product_id={product_id} sku={clean_sku} qty={qty}")
         return ok, msg
     except Exception as exc:
@@ -1338,131 +1113,58 @@ def record_stock_movement(
         return False, f"Transaction failed: {exc}"
 
 
-def bulk_sales_against_stock_batch(sale_rows: list[dict], actor: str) -> tuple[int, list[str]]:
-    if not sale_rows:
-        return 0, ["No sale rows provided."]
+def process_sales_against_stock_csv(df_sales: pd.DataFrame, actor: str) -> tuple[int, list[str]]:
+    """Process bulk SALE rows against current stock levels in Neon."""
+    cols = {str(c).strip().lower(): c for c in df_sales.columns}
+    sku_col = cols.get("sku") or cols.get("product_sku") or cols.get("item_sku")
+    qty_col = cols.get("quantity") or cols.get("qty") or cols.get("sold_qty") or cols.get("units")
+    price_col = cols.get("unit_price") or cols.get("price") or cols.get("selling_price")
+    notes_col = cols.get("notes") or cols.get("reference") or cols.get("ref")
 
-    now_ts = utc_now()
-    aggregated_qty: dict[str, int] = {}
-    events: list[tuple[str, int, float | None, str]] = []
+    if not sku_col or not qty_col:
+        return 0, ["CSV must contain 'sku' (or 'product_sku') and 'quantity' (or 'qty') columns."]
+
+    processed = 0
     errors: list[str] = []
 
-    for idx, r in enumerate(sale_rows):
-        sku = str(r.get("sku") or "").strip().upper()[:120]
-        qty = safe_int(r.get("quantity"), 0)
-        if not sku:
+    for idx, row in df_sales.iterrows():
+        sku_val = str(row.get(sku_col, "") if pd.notna(row.get(sku_col)) else "").strip().upper()
+        qty_val = safe_int(row.get(qty_col), 0)
+        if not sku_val:
             errors.append(f"Row {idx + 1}: Missing SKU.")
             continue
-        if qty <= 0:
-            errors.append(f"Row {idx + 1} ({sku}): Quantity must be > 0.")
+        if qty_val <= 0:
+            errors.append(f"Row {idx + 1} ({sku_val}): Quantity must be greater than 0.")
             continue
 
-        raw_price = r.get("unit_price")
-        u_price = safe_float(raw_price, -1.0) if (raw_price is not None and not pd.isna(raw_price)) else -1.0
-        custom_p = u_price if u_price >= 0 else None
-        note = (str(r.get("notes") or "").strip() or "Bulk sales against stock")[:500]
+        custom_p = None
+        if price_col and pd.notna(row.get(price_col)):
+            parsed_p = safe_float(row.get(price_col), -1.0)
+            if parsed_p >= 0:
+                custom_p = parsed_p
 
-        aggregated_qty[sku] = aggregated_qty.get(sku, 0) + qty
-        events.append((sku, qty, custom_p, note))
-
-    if not events:
-        return 0, errors
-
-    def _op(cur):
-        skus_needed = list(aggregated_qty.keys())
-        cur.execute(
-            """
-            SELECT id, sku, name, stock_qty, selling_price
-            FROM products
-            WHERE UPPER(TRIM(sku)) = ANY(%s)
-            FOR UPDATE;
-            """,
-            (skus_needed,),
+        note_val = (
+            str(row.get(notes_col, "") if pd.notna(row.get(notes_col)) else "").strip()
+            or "Bulk sales against stock CSV"
         )
-        stock_map: dict[str, dict] = {}
-        for p in cur.fetchall() or []:
-            stock_map[str(p.get("sku") or "").strip().upper()] = dict(p)
 
-        blocked_skus: set[str] = set()
-        for sku, req_qty in aggregated_qty.items():
-            prod = stock_map.get(sku)
-            if not prod:
-                errors.append(f"SKU '{sku}' not found in products table.")
-                blocked_skus.add(sku)
-            else:
-                avail = safe_int(prod.get("stock_qty"))
-                if avail < req_qty:
-                    errors.append(
-                        f"SKU '{sku}' ({prod.get('name', '')}): Insufficient stock ({avail} available, {req_qty} requested)."
-                    )
-                    blocked_skus.add(sku)
+        ok, msg = record_stock_movement(
+            product_id=None,
+            tx_type="SALE",
+            quantity=qty_val,
+            custom_price=custom_p,
+            notes=note_val,
+            actor=actor,
+            sku_fallback=sku_val,
+        )
+        if ok:
+            processed += 1
+        else:
+            errors.append(f"Row {idx + 1} ({sku_val}): {msg}")
 
-        running_stock = {
-            k: safe_int(v.get("stock_qty")) for k, v in stock_map.items() if k not in blocked_skus
-        }
-        tx_inserts: list[tuple] = []
-        valid_count = 0
-
-        for sku, qty, custom_p, note in events:
-            if sku in blocked_skus:
-                continue
-            prod = stock_map[sku]
-            unit_p = custom_p if custom_p is not None else safe_float(prod.get("selling_price"))
-            tot_amt = round(qty * unit_p, 2)
-            running_stock[sku] = running_stock[sku] - qty
-            tx_inserts.append(
-                (
-                    "SALE",
-                    safe_int(prod.get("id")),
-                    sku,
-                    str(prod.get("name") or ""),
-                    qty,
-                    unit_p,
-                    tot_amt,
-                    actor,
-                    note,
-                    now_ts,
-                )
-            )
-            valid_count += 1
-
-        if running_stock:
-            update_tuples = [(stock_map[sku]["id"], new_q, now_ts) for sku, new_q in running_stock.items()]
-            extras.execute_values(
-                cur,
-                """
-                UPDATE products AS p
-                SET stock_qty = v.new_qty,
-                    updated_at = v.upd_at
-                FROM (VALUES %s) AS v(pid, new_qty, upd_at)
-                WHERE p.id = v.pid::integer;
-                """,
-                update_tuples,
-                page_size=DB_BATCH_PAGE_SIZE,
-            )
-
-        if tx_inserts:
-            extras.execute_values(
-                cur,
-                """
-                INSERT INTO transactions (tx_type, product_id, sku, product_name, quantity, unit_price, total_amount, recorded_by, notes, created_at)
-                VALUES %s;
-                """,
-                tx_inserts,
-                page_size=DB_BATCH_PAGE_SIZE,
-            )
-
-        return valid_count
-
-    try:
-        processed = run_write_tx(_op)
-        if processed > 0:
-            invalidate_data_caches()
-            log_audit(actor, "BULK_SALES_AGAINST_STOCK", f"Processed {processed} sale rows against stock")
-        return safe_int(processed), errors
-    except Exception as exc:
-        logger.exception("Batch sales against stock failed")
-        return 0, [f"Batch sale transaction failed: {exc}"]
+    if processed > 0:
+        log_audit(actor, "CSV_BULK_SALES", f"Processed {processed} sale rows against stock")
+    return processed, errors
 
 
 def delete_product(product_id: int, actor_role: str, actor: str) -> tuple[bool, str]:
@@ -1477,7 +1179,6 @@ def delete_product(product_id: int, actor_role: str, actor: str) -> tuple[bool, 
         deleted = run_write_tx(_op)
         if not deleted:
             return False, "Product not found."
-        invalidate_data_caches()
         log_audit(actor, "PRODUCT_DELETED", f"{deleted.get('sku')} ({deleted.get('name')})")
         return True, f"Deleted {deleted.get('sku')} — {deleted.get('name')}."
     except Exception as exc:
@@ -1485,79 +1186,62 @@ def delete_product(product_id: int, actor_role: str, actor: str) -> tuple[bool, 
         return False, f"Delete failed: {exc}"
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_transactions_cached(days: int) -> pd.DataFrame:
+def fetch_transactions(days: int = 90) -> pd.DataFrame:
     empty_cols = [
         "id", "tx_type", "sku", "product_name", "quantity",
         "unit_price", "total_amount", "recorded_by", "notes", "created_at",
     ]
-    cutoff = utc_now() - timedelta(days=max(1, safe_int(days, 90)))
-    df = run_read_query(
-        """
-        SELECT
-            id,
-            tx_type,
-            sku,
-            product_name,
-            quantity,
-            unit_price,
-            total_amount,
-            recorded_by,
-            notes,
-            created_at
-        FROM transactions
-        WHERE created_at >= %s
-        ORDER BY created_at DESC, id DESC;
-        """,
-        (cutoff,),
-    )
-    if df.empty:
-        return pd.DataFrame(columns=empty_cols)
-    df["quantity"] = df["quantity"].apply(safe_int)
-    df["unit_price"] = df["unit_price"].apply(safe_float)
-    df["total_amount"] = df["total_amount"].apply(safe_float)
-    return df
-def fetch_transactions(days: int = 90) -> pd.DataFrame:
-        empty_cols = [
-            "id",
-            "tx_type",
-            "sku",
-            "product_name",
-            "quantity",
-            "unit_price",
-            "total_amount",
-            "recorded_by",
-            "notes",
-            "created_at",
-        ]
-        try:
-            return fetch_transactions_cached(max(1, safe_int(days, 90)))
-        except Exception as exc:
-            st.error(f"Failed to load transactions: {exc}")
+    try:
+        run_write_tx(_heal_transactions_table)
+        cutoff = utc_now() - timedelta(days=max(1, safe_int(days, 90)))
+        df = run_read_query(
+            """
+            SELECT
+                id,
+                tx_type,
+                sku,
+                product_name,
+                quantity,
+                unit_price,
+                total_amount,
+                recorded_by,
+                notes,
+                created_at
+            FROM transactions
+            WHERE created_at >= %s
+            ORDER BY created_at DESC, id DESC;
+            """,
+            (cutoff,),
+        )
+        if df.empty:
             return pd.DataFrame(columns=empty_cols)
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_audit_logs_cached(limit: int) -> pd.DataFrame:
-    return run_read_query(
-        """
-        SELECT id, username, action, details, created_at
-        FROM audit_logs
-        ORDER BY created_at DESC, id DESC
-        LIMIT %s;
-        """,
-        (max(1, min(safe_int(limit, 100), 1000)),),
-    )
+        df["quantity"] = df["quantity"].apply(safe_int)
+        df["unit_price"] = df["unit_price"].apply(safe_float)
+        df["total_amount"] = df["total_amount"].apply(safe_float)
+        return df
+    except Exception as exc:
+        st.error(f"Failed to load transactions: {exc}")
+        return pd.DataFrame(columns=empty_cols)
 
 
 def fetch_audit_logs(limit: int = 100) -> pd.DataFrame:
     try:
-        return fetch_audit_logs_cached(max(1, min(safe_int(limit, 100), 1000)))
+        run_write_tx(_heal_audit_logs_table)
+        return run_read_query(
+            """
+            SELECT id, username, action, details, created_at
+            FROM audit_logs
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s;
+            """,
+            (max(1, min(safe_int(limit, 100), 1000)),),
+        )
     except Exception as exc:
         st.error(f"Failed to load audit logs: {exc}")
         return pd.DataFrame()
 
-
 # ==============================================================================
-# 8. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
+# 6. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
 # ==============================================================================
 def _copyright_span() -> str:
     curr_year = date.today().year
@@ -1574,6 +1258,7 @@ def render_developer_footer():
 
 
 def maybe_show_daily_welcome(user: dict):
+    """Show a daily welcome banner once per calendar day per signed-in user."""
     today_str = date.today().isoformat()
     uname = str(user.get("username") or "user").lower()
     seen_key = f"daily_welcome_shown_{uname}"
@@ -1588,7 +1273,7 @@ def maybe_show_daily_welcome(user: dict):
 
 
 # ==============================================================================
-# 9. AUTHENTICATION & PASSWORD RECOVERY UI
+# 7. AUTHENTICATION & PASSWORD RECOVERY UI
 # ==============================================================================
 def render_auth_screen():
     st.title("Enterprise AI Inventory & BI Command Centre")
@@ -1597,7 +1282,7 @@ def render_auth_screen():
         "Sign in, register a staff account, or recover a forgotten password."
     )
 
-    _, col_center, _ = st.columns([0.2, 2.6, 0.2])
+    _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
         tab_login, tab_register, tab_recover = st.tabs(["Sign In", "Sign Up (Staff)", "Recover Password"])
 
@@ -1674,7 +1359,7 @@ def render_auth_screen():
 
 
 # ==============================================================================
-# 10. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
+# 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
 # ==============================================================================
 def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
     st.subheader("Executive KPIs & Alerts")
@@ -1711,7 +1396,7 @@ def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
 
     st.subheader("Recent Transactions")
     if not tx_df.empty:
-        st.dataframe(tx_df.head(25), use_container_width=True, hide_index=True)
+        st.dataframe(tx_df.head(15), use_container_width=True, hide_index=True)
     else:
         st.info("No transactions recorded yet.")
 
@@ -1726,10 +1411,10 @@ def render_inventory_tab(products_df: pd.DataFrame, user: dict):
         if products_df.empty:
             st.info("Add products first to record stock movements.")
         else:
-            product_options = {
-                f"{row.get('sku', '')} — {row.get('name', '')} (Qty: {safe_int(row.get('stock_qty'))})": safe_int(row.get("id"))
-                for _, row in products_df.iterrows()
-            }
+            product_options = {}
+            for _, row in products_df.iterrows():
+                label = f"{row.get('sku', '')} — {row.get('name', '')} (Qty: {safe_int(row.get('stock_qty'))})"
+                product_options[label] = safe_int(row.get("id"))
 
             with st.form("movement_form", clear_on_submit=True):
                 selected_label = st.selectbox("Product", list(product_options.keys()))
@@ -1864,6 +1549,7 @@ def render_bi_analytics_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
             sales_only = sales_only.dropna(subset=["date"])
             if not sales_only.empty:
                 daily_sales = sales_only.groupby("date", as_index=False)["total_amount"].sum()
+
                 st.markdown("#### Daily Sales Trend")
                 fig_sales = px.line(
                     daily_sales,
@@ -1886,41 +1572,20 @@ def render_bi_analytics_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
                 )
                 st.dataframe(top_prods, use_container_width=True, hide_index=True)
         else:
-            st.info("Record SALE movements or import Sales Against Stock files to populate sales charts.")
+            st.info("Record SALE movements in the Inventory tab to populate sales charts.")
     else:
         st.info("No transaction data available for analytics yet.")
 
 
-def _sheet_selector_if_excel(uploaded_file, key_prefix: str) -> str | int:
-    fname = str(getattr(uploaded_file, "name", "") or "").lower()
-    if fname.endswith(".xlsx") or fname.endswith(".xls"):
-        try:
-            sheets = list_excel_sheets(uploaded_file)
-            if sheets:
-                return st.selectbox("Excel Sheet", sheets, index=0, key=f"{key_prefix}_sheet")
-        except Exception:
-            pass
-    return 0
-
-
 def render_bulk_import_tab(user: dict):
-    st.subheader("Heavy-Duty Upload Hub: Catalog, Sales Against Stock & Any CSV / Excel Analyzer")
-    st.caption(
-        "Supports CSV, XLSX, and XLS files with multi-layer headers (1–3 header rows), wide multi-column layouts, and chunked batch processing."
-    )
+    st.subheader("Bulk CSV Multitask: Product Catalog & Sales Against Stock")
 
-    sub_catalog, sub_sales_stock, sub_any_analyze = st.tabs(
-        [
-            "1. Catalog Import (CSV / Excel)",
-            "2. Sales Against Stock (CSV / Excel)",
-            "3. Analyze Sales, Stock & Any File (CSV / Excel)",
-        ]
-    )
+    col_cat, col_sales = st.columns(2)
 
-# --------------------------------------------------------------------------
-    # SUB-TAB 1: BULK CATALOG IMPORT (CSV / EXCEL)
-    # --------------------------------------------------------------------------
-    with sub_catalog:
+    with col_cat:
+        st.markdown("#### 1. Bulk CSV Product Catalog Import")
+        st.caption("Columns: `sku`, `name`, `category`, `unit_cost`, `selling_price`, `stock_qty`, `reorder_level`.")
+
         sample_prod_csv = (
             "sku,name,category,unit_cost,selling_price,stock_qty,reorder_level\n"
             "SKU-2001,USB-C Hub 7-Port,Accessories,45.00,75.00,30,10\n"
@@ -1934,84 +1599,51 @@ def render_bulk_import_tab(user: dict):
             key="dl_sample_prod_csv",
         )
 
-        c_opt1, c_opt2 = st.columns([1, 2])
-        prod_layers = c_opt1.selectbox("Header Layers (Rows)", [1, 2, 3], index=0, key="prod_header_layers")
-        uploaded_prod = c_opt2.file_uploader(
-            "Upload Product Catalog File (CSV, XLSX, XLS)",
-            type=["csv", "xlsx", "xls"],
-            key="upload_prod_file",
-        )
-
+        uploaded_prod = st.file_uploader("Choose Product CSV file", type=["csv"], key="upload_prod_csv")
         if uploaded_prod is not None:
             try:
-                sheet_sel = _sheet_selector_if_excel(uploaded_prod, "prod")
-                chunks, meta = parse_tabular_chunks(uploaded_prod, header_layers=prod_layers, sheet_name=sheet_sel)
-                preview_df = chunks[0]
-                all_cols = list(preview_df.columns)
+                df_up = pd.read_csv(uploaded_prod)
+                if df_up.empty:
+                    st.warning("Uploaded product CSV is empty.")
+                else:
+                    st.dataframe(df_up.head(20), use_container_width=True, hide_index=True)
 
-                st.caption(
-                    f"Source: `{meta['format']}` • `{meta['total_rows']:,}` rows × `{meta['total_columns']}` cols "
-                    f"across `{meta['chunk_count']}` chunk(s)."
-                )
-                st.dataframe(preview_df.head(15), use_container_width=True, hide_index=True)
+                    if st.button("Import Products Into Neon", type="primary", key="btn_import_prod_csv"):
+                        normalized_cols = {str(c).strip().lower() for c in df_up.columns}
+                        if not {"sku", "name"}.issubset(normalized_cols):
+                            st.error("CSV must contain at least 'sku' and 'name' columns.")
+                        else:
+                            df_up.columns = [str(c).strip().lower() for c in df_up.columns]
+                            imported = 0
+                            errors = []
+                            for idx, row in df_up.iterrows():
+                                ok, msg = add_or_update_product(
+                                    sku=str(row.get("sku", "") if pd.notna(row.get("sku")) else ""),
+                                    name=str(row.get("name", "") if pd.notna(row.get("name")) else ""),
+                                    category=str(row.get("category", "General")) if pd.notna(row.get("category")) else "General",
+                                    unit_cost=safe_float(row.get("unit_cost"), 0.0),
+                                    selling_price=safe_float(row.get("selling_price"), 0.0),
+                                    stock_qty=safe_int(row.get("stock_qty"), 0),
+                                    reorder_level=safe_int(row.get("reorder_level"), 10),
+                                    actor=user["username"],
+                                )
+                                if ok:
+                                    imported += 1
+                                else:
+                                    errors.append(f"Row {idx + 1}: {msg}")
 
-                map_opts = ["<Auto / None>"] + all_cols
-                m1, m2, m3 = st.columns(3)
-                col_sku = m1.selectbox("SKU Column", map_opts, index=0, key="p_map_sku")
-                col_name = m2.selectbox("Name Column", map_opts, index=0, key="p_map_name")
-                col_cat = m3.selectbox("Category Column", map_opts, index=0, key="p_map_cat")
-
-                m4, m5, m6, m7 = st.columns(4)
-                col_cost = m4.selectbox("Unit Cost", map_opts, index=0, key="p_map_cost")
-                col_price = m5.selectbox("Selling Price", map_opts, index=0, key="p_map_price")
-                col_qty = m6.selectbox("Stock Qty", map_opts, index=0, key="p_map_qty")
-                col_reord = m7.selectbox("Reorder Level", map_opts, index=0, key="p_map_reord")
-
-                if st.button("Import Catalog Into Neon", type="primary", key="btn_import_prod_file"):
-                    res_sku = _resolve_mapped_column(all_cols, col_sku, ("sku", "product_sku", "item_sku", "code", "item_code"))
-                    res_name = _resolve_mapped_column(all_cols, col_name, ("name", "product_name", "item_name", "title", "description"))
-
-                    if not res_sku or not res_name:
-                        st.error("Could not resolve required 'SKU' and 'Name' columns. Select them manually above.")
-                    else:
-                        res_cat = _resolve_mapped_column(all_cols, col_cat, ("category", "cat", "group", "department"))
-                        res_cost = _resolve_mapped_column(all_cols, col_cost, ("unit_cost", "cost", "cost_price", "buy_price"))
-                        res_price = _resolve_mapped_column(all_cols, col_price, ("selling_price", "price", "sell_price", "retail_price"))
-                        res_qty = _resolve_mapped_column(all_cols, col_qty, ("stock_qty", "quantity", "qty", "stock", "balance"))
-                        res_reord = _resolve_mapped_column(all_cols, col_reord, ("reorder_level", "reorder", "min_stock", "threshold"))
-
-                        total_imported = 0
-                        all_errors: list[str] = []
-                        progress = st.progress(0.0, text="Importing catalog chunks...")
-
-                        for c_idx, ch in enumerate(chunks):
-                            batch_records = [
-                                {
-                                    "sku": row.get(res_sku),
-                                    "name": row.get(res_name),
-                                    "category": row.get(res_cat) if res_cat else "General",
-                                    "unit_cost": row.get(res_cost) if res_cost else 0.0,
-                                    "selling_price": row.get(res_price) if res_price else 0.0,
-                                    "stock_qty": row.get(res_qty) if res_qty else 0,
-                                    "reorder_level": row.get(res_reord) if res_reord else 10,
-                                }
-                                for _, row in ch.iterrows()
-                            ]
-                            imp, errs = bulk_upsert_products_batch(batch_records, actor=user["username"])
-                            total_imported += imp
-                            all_errors.extend(errs)
-                            progress.progress(min(1.0, (c_idx + 1) / max(1, len(chunks))))
-
-                        st.success(f"Imported/updated {total_imported:,} products.")
-                        if all_errors:
-                            st.warning(f"{len(all_errors)} row issue(s):\n" + "\n".join(all_errors[:25]))
+                            log_audit(user["username"], "CSV_BULK_IMPORT", f"Imported {imported} rows")
+                            st.success(f"Imported/updated {imported} products.")
+                            if errors:
+                                st.warning("\n".join(errors))
+                            st.rerun()
             except Exception as exc:
-                st.error(f"Could not process product file: {exc}")
+                st.error(f"Could not read product CSV: {exc}")
 
-    # --------------------------------------------------------------------------
-    # SUB-TAB 2: IMPORT SALES AGAINST STOCK (CSV / EXCEL)
-    # --------------------------------------------------------------------------
-    with sub_sales_stock:
+    with col_sales:
+        st.markdown("#### 2. Import Sales Against Stock CSV")
+        st.caption("Deducts sold quantities from matching `sku` stock and records `SALE` transactions. Optional: `unit_price`, `notes`.")
+
         sample_sales_csv = (
             "sku,quantity,unit_price,notes\n"
             "SKU-1001,2,260.00,Batch Sale #1\n"
@@ -2025,160 +1657,25 @@ def render_bulk_import_tab(user: dict):
             key="dl_sample_sales_csv",
         )
 
-        s_opt1, s_opt2 = st.columns([1, 2])
-        sales_layers = s_opt1.selectbox("Header Layers (Rows)", [1, 2, 3], index=0, key="sales_header_layers")
-        uploaded_sales = s_opt2.file_uploader(
-            "Upload Sales File to Deduct Against Stock (CSV, XLSX, XLS)",
-            type=["csv", "xlsx", "xls"],
-            key="upload_sales_file",
-        )
-
+        uploaded_sales = st.file_uploader("Choose Sales CSV file", type=["csv"], key="upload_sales_csv")
         if uploaded_sales is not None:
             try:
-                s_sheet = _sheet_selector_if_excel(uploaded_sales, "sales")
-                s_chunks, s_meta = parse_tabular_chunks(uploaded_sales, header_layers=sales_layers, sheet_name=s_sheet)
-                s_preview = s_chunks[0]
-                s_cols = list(s_preview.columns)
+                df_sales = pd.read_csv(uploaded_sales)
+                if df_sales.empty:
+                    st.warning("Uploaded sales CSV is empty.")
+                else:
+                    st.dataframe(df_sales.head(20), use_container_width=True, hide_index=True)
 
-                st.caption(
-                    f"Source: `{s_meta['format']}` • `{s_meta['total_rows']:,}` rows × `{s_meta['total_columns']}` cols "
-                    f"across `{s_meta['chunk_count']}` chunk(s)."
-                )
-                st.dataframe(s_preview.head(15), use_container_width=True, hide_index=True)
-
-                s_map_opts = ["<Auto / None>"] + s_cols
-                sm1, sm2, sm3, sm4 = st.columns(4)
-                s_col_sku = sm1.selectbox("SKU Column", s_map_opts, index=0, key="s_map_sku")
-                s_col_qty = sm2.selectbox("Sold Qty", s_map_opts, index=0, key="s_map_qty")
-                s_col_price = sm3.selectbox("Unit Price", s_map_opts, index=0, key="s_map_price")
-                s_col_notes = sm4.selectbox("Notes / Ref", s_map_opts, index=0, key="s_map_notes")
-
-                if st.button("Process Sales Against Stock", type="primary", key="btn_import_sales_file"):
-                    res_s_sku = _resolve_mapped_column(s_cols, s_col_sku, ("sku", "product_sku", "item_sku", "code", "item_code"))
-                    res_s_qty = _resolve_mapped_column(s_cols, s_col_qty, ("quantity", "qty", "sold_qty", "sold", "units"))
-
-                    if not res_s_sku or not res_s_qty:
-                        st.error("Could not resolve required 'SKU' and 'Sold Qty' columns. Select them manually above.")
-                    else:
-                        res_s_price = _resolve_mapped_column(s_cols, s_col_price, ("unit_price", "price", "selling_price", "amount"))
-                        res_s_notes = _resolve_mapped_column(s_cols, s_col_notes, ("notes", "note", "reference", "ref", "remarks"))
-
-                        total_processed = 0
-                        all_s_errors: list[str] = []
-                        s_progress = st.progress(0.0, text="Processing sales against stock...")
-
-                        for c_idx, ch in enumerate(s_chunks):
-                            sale_batch = [
-                                {
-                                    "sku": row.get(res_s_sku),
-                                    "quantity": row.get(res_s_qty),
-                                    "unit_price": row.get(res_s_price) if res_s_price else None,
-                                    "notes": row.get(res_s_notes) if res_s_notes else "Bulk sales against stock",
-                                }
-                                for _, row in ch.iterrows()
-                            ]
-                            proc, s_errs = bulk_sales_against_stock_batch(sale_batch, actor=user["username"])
-                            total_processed += proc
-                            all_s_errors.extend(s_errs)
-                            s_progress.progress(min(1.0, (c_idx + 1) / max(1, len(s_chunks))))
-
-                        st.success(f"Recorded {total_processed:,} sales against stock.")
-                        if all_s_errors:
-                            st.warning(f"{len(all_s_errors)} issue(s):\n" + "\n".join(all_s_errors[:25]))
+                    if st.button("Process Sales Against Stock", type="primary", key="btn_import_sales_csv"):
+                        processed, errors = process_sales_against_stock_csv(df_sales, actor=user["username"])
+                        if processed > 0:
+                            st.success(f"Recorded {processed} sales against stock.")
+                        if errors:
+                            st.warning("\n".join(errors))
+                        if processed > 0:
+                            st.rerun()
             except Exception as exc:
-                st.error(f"Could not process sales file: {exc}")
-
-    # --------------------------------------------------------------------------
-    # SUB-TAB 3: UNIVERSAL SALES, STOCK & ANY FILE ANALYZER (CSV / EXCEL)
-    # --------------------------------------------------------------------------
-    with sub_any_analyze:
-        st.markdown("#### Upload Any Sales, Stock, or Business CSV / Excel File to Analyze")
-        st.caption(
-            "Works on any dataset—sales logs, stock sheets, multi-layer reports, or wide tables—without forcing database writes."
-        )
-
-        a_opt1, a_opt2 = st.columns([1, 2])
-        any_layers = a_opt1.selectbox("Header Layers (Rows)", [1, 2, 3], index=0, key="any_header_layers")
-        uploaded_any = a_opt2.file_uploader(
-            "Upload Any Sales, Stock, or Data File (CSV, XLSX, XLS)",
-            type=["csv", "xlsx", "xls"],
-            key="upload_any_file",
-        )
-
-        if uploaded_any is not None:
-            try:
-                a_sheet = _sheet_selector_if_excel(uploaded_any, "any")
-                a_chunks, a_meta = parse_tabular_chunks(uploaded_any, header_layers=any_layers, sheet_name=a_sheet)
-                df_all = pd.concat(a_chunks, ignore_index=True)
-
-                st.caption(
-                    f"Loaded `{len(df_all):,}` rows × `{len(df_all.columns):,}` columns from `{a_meta['format']}`."
-                )
-
-                numeric_cols = [
-                    c for c in df_all.columns
-                    if pd.to_numeric(df_all[c], errors="coerce").notna().sum() > 0
-                ]
-                cat_cols = [c for c in df_all.columns if c not in numeric_cols]
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Total Rows", f"{len(df_all):,}")
-                k2.metric("Total Columns", f"{len(df_all.columns):,}")
-                k3.metric("Numeric Columns", f"{len(numeric_cols):,}")
-                k4.metric("Missing Cells", f"{int(df_all.isna().sum().sum()):,}")
-
-                if cat_cols:
-                    f_col = st.selectbox("Filter by Column (Optional)", ["<All Rows>"] + cat_cols, key="any_filter_col")
-                    if f_col != "<All Rows>":
-                        vals = ["<All>"] + sorted(df_all[f_col].dropna().astype(str).unique().tolist())[:200]
-                        f_val = st.selectbox("Filter Value", vals, key="any_filter_val")
-                        if f_val != "<All>":
-                            df_all = df_all[df_all[f_col].astype(str) == f_val]
-
-                st.dataframe(df_all.head(200), use_container_width=True, hide_index=True)
-
-                if numeric_cols:
-                    st.markdown("##### Column Statistical Summary")
-                    num_frame = pd.DataFrame({c: pd.to_numeric(df_all[c], errors="coerce") for c in numeric_cols})
-                    summary_stats = pd.DataFrame(
-                        {
-                            "count": num_frame.count(),
-                            "sum": num_frame.sum(),
-                            "mean": num_frame.mean(),
-                            "median": num_frame.median(),
-                            "std": num_frame.std(),
-                            "min": num_frame.min(),
-                            "max": num_frame.max(),
-                        }
-                    ).round(2)
-                    st.dataframe(summary_stats, use_container_width=True)
-
-                    ch1, ch2 = st.columns(2)
-                    group_choices = ["<None>"] + list(df_all.columns)
-                    grp_col = ch1.selectbox("Group / X-Axis Column", group_choices, key="any_grp_col")
-                    val_col = ch2.selectbox("Metric / Y-Axis Column", numeric_cols, key="any_val_col")
-
-                    y_series = pd.to_numeric(df_all[val_col], errors="coerce")
-                    if grp_col != "<None>":
-                        chart_df = pd.DataFrame({"group": df_all[grp_col].astype(str), "value": y_series}).dropna()
-                        agg_df = chart_df.groupby("group", as_index=False)["value"].sum().sort_values("value", ascending=False).head(25)
-                        fig_any = px.bar(agg_df, x="group", y="value", title=f"Total {val_col} by {grp_col}")
-                        st.plotly_chart(fig_any, use_container_width=True)
-                    else:
-                        fig_hist = px.histogram(y_series.dropna(), title=f"Distribution of {val_col}")
-                        st.plotly_chart(fig_hist, use_container_width=True)
-
-                out_csv = io.StringIO()
-                df_all.to_csv(out_csv, index=False)
-                st.download_button(
-                    label="Download Analyzed Dataset (CSV)",
-                    data=out_csv.getvalue(),
-                    file_name=f"analyzed_{date.today().isoformat()}.csv",
-                    mime="text/csv",
-                    key="dl_analyzed_csv",
-                )
-            except Exception as exc:
-                st.error(f"Could not analyze file: {exc}")
+                st.error(f"Could not read sales CSV: {exc}")
 
 
 def render_admin_tab(user: dict):
@@ -2298,7 +1795,7 @@ def render_main_app(user: dict):
 
     tab_labels = ["Overview & KPIs", "Inventory & Sales"]
     if is_admin:
-        tab_labels.extend(["BI Analytics", "Upload & Analyze", "Users & Audit Log"])
+        tab_labels.extend(["BI Analytics", "CSV Import", "Users & Audit Log"])
 
     tabs = st.tabs(tab_labels)
 
@@ -2320,12 +1817,588 @@ def render_main_app(user: dict):
 
     render_developer_footer()
 
+    
+# ==============================================================================
+# 6. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
+# ==============================================================================
+def _copyright_span() -> str:
+    curr_year = date.today().year
+    return "2025" if curr_year <= 2025 else f"2025–{curr_year}"
+
+
+def render_developer_footer():
+    st.divider()
+    st.caption(
+        f"© {_copyright_span()} **{DEVELOPER_COMPANY}** • "
+        f"Contact: `{DEVELOPER_EMAIL}` • Dev: **{DEVELOPER_HANDLE}** (`@{DEVELOPER_GITHUB}`) • "
+        "All rights reserved."
+    )
+
+
+def maybe_show_daily_welcome(user: dict):
+    """Show a daily welcome banner once per calendar day per signed-in user."""
+    today_str = date.today().isoformat()
+    uname = str(user.get("username") or "user").lower()
+    seen_key = f"daily_welcome_shown_{uname}"
+    if st.session_state.get(seen_key) != today_str:
+        st.session_state[seen_key] = today_str
+        display_name = user.get("full_name") or user.get("username") or "Team Member"
+        role_label = str(user.get("role") or "staff").capitalize()
+        st.success(
+            f"Welcome back, **{display_name}** (`@{uname}` • {role_label})! "
+            f"Wishing you a smooth and productive day on {date.today().strftime('%A, %B %d, %Y')}."
+        )
+
 
 # ==============================================================================
-# 11. ENTRY POINT
+# 7. AUTHENTICATION & PASSWORD RECOVERY UI
+# ==============================================================================
+def render_auth_screen():
+    st.title("Enterprise AI Inventory & BI Command Centre")
+    st.caption(
+        f"{DEVELOPER_COMPANY} • {DEVELOPER_EMAIL} • "
+        "Sign in, register a staff account, or recover a forgotten password."
+    )
+
+    _, col_center, _ = st.columns([1, 2, 1])
+    with col_center:
+        tab_login, tab_register, tab_recover = st.tabs(["Sign In", "Sign Up (Staff)", "Recover Password"])
+
+        with tab_login:
+            with st.form("login_form", clear_on_submit=False):
+                username = st.text_input("Username", placeholder="Enter your username")
+                password = st.text_input("Password", type="password", placeholder="Enter your password")
+                submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
+                if submitted:
+                    user = authenticate_user(username, password)
+                    if user:
+                        st.session_state["auth_user"] = user
+                        log_audit(user["username"], "USER_LOGIN", "Successful sign-in")
+                        st.rerun()
+                    else:
+                        log_audit((username or "").strip().lower() or "unknown", "LOGIN_FAILED", "Invalid credentials")
+                        st.error("Invalid username or password, or account is inactive.")
+
+        with tab_register:
+            with st.form("register_form", clear_on_submit=True):
+                full_name = st.text_input("Full Name", placeholder="e.g. Kwame Mensah")
+                new_username = st.text_input("Username", placeholder="Lowercase, min 3 chars")
+                new_password = st.text_input("Password", type="password", placeholder="Min 6 characters")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                st.caption("New sign-ups default to `staff`. Admin privileges are assigned only by an administrator.")
+                created = st.form_submit_button("Create Staff Account", use_container_width=True)
+                if created:
+                    if new_password != confirm_password:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, msg = register_staff_user(new_username, full_name, new_password)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+        with tab_recover:
+            st.markdown("#### Step 1: Request a Reset Token")
+            with st.form("request_token_form", clear_on_submit=False):
+                rec_username = st.text_input("Account Username", placeholder="Enter username to recover")
+                req_token = st.form_submit_button("Generate Recovery Token", use_container_width=True)
+                if req_token:
+                    found, token = issue_password_reset_token(rec_username, ttl_minutes=RECOVERY_TOKEN_TTL_MINUTES)
+                    if found and token:
+                        st.session_state["recovery_token_preview"] = token
+                        unit_label = "minute" if RECOVERY_TOKEN_TTL_MINUTES == 1 else "minutes"
+                        st.success(
+                            f"Recovery token generated (valid for {RECOVERY_TOKEN_TTL_MINUTES} {unit_label}). "
+                            "Copy it below to reset the password:"
+                        )
+                        st.code(token, language="text")
+                    else:
+                        st.info("If an active account matches that username, a recovery token has been logged.")
+
+            st.markdown("#### Step 2: Set a New Password With Token")
+            default_tok = st.session_state.get("recovery_token_preview", "")
+            with st.form("reset_with_token_form", clear_on_submit=True):
+                token_input = st.text_input("Recovery Token", value=default_tok, placeholder="Paste your recovery token")
+                rec_new_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
+                rec_confirm_pw = st.text_input("Confirm New Password", type="password")
+                reset_btn = st.form_submit_button("Reset Password", type="primary", use_container_width=True)
+                if reset_btn:
+                    if rec_new_pw != rec_confirm_pw:
+                        st.error("New passwords do not match.")
+                    else:
+                        ok, msg = reset_password_with_token(token_input, rec_new_pw)
+                        if ok:
+                            st.session_state.pop("recovery_token_preview", None)
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+        render_developer_footer()
+
+
+# ==============================================================================
+# 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
+# ==============================================================================
+def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
+    st.subheader("Executive KPIs & Alerts")
+
+    total_skus = len(products_df)
+    total_units = safe_int(products_df["stock_qty"].sum()) if not products_df.empty and "stock_qty" in products_df else 0
+    inventory_cost_val = safe_float(products_df["stock_value"].sum()) if not products_df.empty and "stock_value" in products_df else 0.0
+
+    low_stock_df = pd.DataFrame()
+    if not products_df.empty and "status" in products_df:
+        low_stock_df = products_df[products_df["status"].isin(["Low Stock", "Out of Stock"])]
+
+    sales_df = pd.DataFrame()
+    if not tx_df.empty and "tx_type" in tx_df:
+        sales_df = tx_df[tx_df["tx_type"] == "SALE"]
+
+    total_sales_rev = safe_float(sales_df["total_amount"].sum()) if not sales_df.empty and "total_amount" in sales_df else 0.0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Active SKUs", f"{total_skus:,}")
+    c2.metric("Total Stock Units", f"{total_units:,}")
+    c3.metric("Stock Valuation (Cost)", f"{inventory_cost_val:,.2f}")
+    c4.metric("Recorded Sales Revenue", f"{total_sales_rev:,.2f}")
+    c5.metric("Low / Out of Stock", f"{len(low_stock_df):,}")
+
+    st.divider()
+
+    if not low_stock_df.empty:
+        st.warning("Attention: The following items are at or below their reorder threshold:")
+        cols = [c for c in ["sku", "name", "category", "stock_qty", "reorder_level", "status"] if c in low_stock_df.columns]
+        st.dataframe(low_stock_df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.success("All inventory items are above their reorder thresholds.")
+
+    st.subheader("Recent Transactions")
+    if not tx_df.empty:
+        st.dataframe(tx_df.head(15), use_container_width=True, hide_index=True)
+    else:
+        st.info("No transactions recorded yet.")
+
+
+def render_inventory_tab(products_df: pd.DataFrame, user: dict):
+    st.subheader("Inventory Catalog & Stock Movements")
+
+    col_left, col_right = st.columns([1, 1.4])
+
+    with col_left:
+        st.markdown("#### Record Sale or Restock")
+        if products_df.empty:
+            st.info("Add products first to record stock movements.")
+        else:
+            product_options = {}
+            for _, row in products_df.iterrows():
+                label = f"{row.get('sku', '')} — {row.get('name', '')} (Qty: {safe_int(row.get('stock_qty'))})"
+                product_options[label] = safe_int(row.get("id"))
+
+            with st.form("movement_form", clear_on_submit=True):
+                selected_label = st.selectbox("Product", list(product_options.keys()))
+                tx_type = st.selectbox("Movement Type", ["SALE", "RESTOCK"])
+                qty = st.number_input("Quantity", min_value=1, step=1, value=1)
+                override_price = st.number_input(
+                    "Custom Unit Price (0 = use default price/cost)",
+                    min_value=0.0,
+                    step=0.5,
+                    value=0.0,
+                )
+                notes = st.text_input("Notes / Reference", placeholder="e.g. Receipt #104 or Supplier delivery")
+                submitted = st.form_submit_button("Submit Movement", type="primary", use_container_width=True)
+                if submitted:
+                    prod_id = product_options[selected_label]
+                    price_val = None if override_price <= 0 else float(override_price)
+                    ok, msg = record_stock_movement(
+                        product_id=prod_id,
+                        tx_type=tx_type,
+                        quantity=int(qty),
+                        custom_price=price_val,
+                        notes=notes,
+                        actor=user["username"],
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        st.markdown("#### Add or Update Product")
+        with st.form("product_form", clear_on_submit=True):
+            sku = st.text_input("SKU", placeholder="e.g. SKU-1005")
+            name = st.text_input("Product Name", placeholder="e.g. Barcode Label Printer")
+            category = st.text_input("Category", value="General")
+            col_c, col_p = st.columns(2)
+            unit_cost = col_c.number_input("Unit Cost", min_value=0.0, step=0.5, value=0.0)
+            selling_price = col_p.number_input("Selling Price", min_value=0.0, step=0.5, value=0.0)
+            col_q, col_r = st.columns(2)
+            stock_qty = col_q.number_input("Stock Quantity", min_value=0, step=1, value=0)
+            reorder_level = col_r.number_input("Reorder Level", min_value=0, step=1, value=10)
+            saved = st.form_submit_button("Save Product", use_container_width=True)
+            if saved:
+                ok, msg = add_or_update_product(
+                    sku=sku,
+                    name=name,
+                    category=category,
+                    unit_cost=float(unit_cost),
+                    selling_price=float(selling_price),
+                    stock_qty=int(stock_qty),
+                    reorder_level=int(reorder_level),
+                    actor=user["username"],
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    with col_right:
+        st.markdown("#### Current Stock Table")
+        if products_df.empty:
+            st.info("No products found.")
+        else:
+            search_q = st.text_input("Filter by SKU, Name, or Category", placeholder="Type to filter...")
+            filtered = products_df.copy()
+            if search_q and search_q.strip():
+                q = search_q.strip().lower()
+                mask = pd.Series(False, index=filtered.index)
+                for col in ["sku", "name", "category"]:
+                    if col in filtered.columns:
+                        mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(q, regex=False)
+                filtered = filtered[mask]
+
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+            csv_buf = io.StringIO()
+            filtered.to_csv(csv_buf, index=False)
+            st.download_button(
+                label="Download Filtered Inventory CSV",
+                data=csv_buf.getvalue(),
+                file_name=f"inventory_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
+
+            if user.get("role") == "admin":
+                st.markdown("##### Admin: Delete Product")
+                del_map = {
+                    f"{r.get('sku', '')} — {r.get('name', '')}": safe_int(r.get("id"))
+                    for _, r in products_df.iterrows()
+                }
+                if del_map:
+                    del_choice = st.selectbox("Select product to remove", list(del_map.keys()), key="del_prod_select")
+                    if st.button("Delete Selected Product", type="secondary"):
+                        ok, msg = delete_product(
+                            del_map[del_choice],
+                            actor_role=user.get("role", "staff"),
+                            actor=user["username"],
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+
+def render_bi_analytics_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
+    st.subheader("Business Intelligence & Analytics")
+
+    if not products_df.empty and {"category", "stock_value"}.issubset(products_df.columns):
+        st.markdown("#### Stock Value by Category")
+        agg_cols = [c for c in ["stock_qty", "stock_value", "retail_value"] if c in products_df.columns]
+        cat_summary = (
+            products_df.groupby("category", as_index=False)[agg_cols]
+            .sum()
+            .sort_values("stock_value", ascending=False)
+        )
+        hover_cols = [c for c in ["stock_qty", "retail_value"] if c in cat_summary.columns]
+        fig_cat = px.bar(
+            cat_summary,
+            x="category",
+            y="stock_value",
+            hover_data=hover_cols,
+            title="Inventory Cost Valuation by Category",
+        )
+        st.plotly_chart(fig_cat, use_container_width=True)
+
+    if not tx_df.empty and {"tx_type", "created_at", "total_amount"}.issubset(tx_df.columns):
+        sales_only = tx_df[tx_df["tx_type"] == "SALE"].copy()
+        if not sales_only.empty:
+            sales_only["date"] = pd.to_datetime(sales_only["created_at"], utc=True, errors="coerce").dt.date
+            sales_only = sales_only.dropna(subset=["date"])
+            if not sales_only.empty:
+                daily_sales = sales_only.groupby("date", as_index=False)["total_amount"].sum()
+
+                st.markdown("#### Daily Sales Trend")
+                fig_sales = px.line(
+                    daily_sales,
+                    x="date",
+                    y="total_amount",
+                    markers=True,
+                    title="Daily Revenue From Recorded Sales",
+                )
+                st.plotly_chart(fig_sales, use_container_width=True)
+
+            group_cols = [c for c in ["sku", "product_name"] if c in sales_only.columns]
+            metric_cols = [c for c in ["quantity", "total_amount"] if c in sales_only.columns]
+            if group_cols and metric_cols:
+                st.markdown("#### Top Selling Products by Revenue")
+                top_prods = (
+                    sales_only.groupby(group_cols, as_index=False)[metric_cols]
+                    .sum()
+                    .sort_values("total_amount", ascending=False)
+                    .head(10)
+                )
+                st.dataframe(top_prods, use_container_width=True, hide_index=True)
+        else:
+            st.info("Record SALE movements in the Inventory tab to populate sales charts.")
+    else:
+        st.info("No transaction data available for analytics yet.")
+
+
+def render_bulk_import_tab(user: dict):
+    st.subheader("Bulk CSV Multitask: Product Catalog & Sales Against Stock")
+
+    col_cat, col_sales = st.columns(2)
+
+    with col_cat:
+        st.markdown("#### 1. Bulk CSV Product Catalog Import")
+        st.caption("Columns: `sku`, `name`, `category`, `unit_cost`, `selling_price`, `stock_qty`, `reorder_level`.")
+
+        sample_prod_csv = (
+            "sku,name,category,unit_cost,selling_price,stock_qty,reorder_level\n"
+            "SKU-2001,USB-C Hub 7-Port,Accessories,45.00,75.00,30,10\n"
+            "SKU-2002,A4 Thermal Labels,Supplies,12.00,22.00,50,15\n"
+        )
+        st.download_button(
+            label="Download Sample Product CSV",
+            data=sample_prod_csv,
+            file_name="sample_products_import.csv",
+            mime="text/csv",
+            key="dl_sample_prod_csv",
+        )
+
+        uploaded_prod = st.file_uploader("Choose Product CSV file", type=["csv"], key="upload_prod_csv")
+        if uploaded_prod is not None:
+            try:
+                df_up = pd.read_csv(uploaded_prod)
+                if df_up.empty:
+                    st.warning("Uploaded product CSV is empty.")
+                else:
+                    st.dataframe(df_up.head(20), use_container_width=True, hide_index=True)
+
+                    if st.button("Import Products Into Neon", type="primary", key="btn_import_prod_csv"):
+                        normalized_cols = {str(c).strip().lower() for c in df_up.columns}
+                        if not {"sku", "name"}.issubset(normalized_cols):
+                            st.error("CSV must contain at least 'sku' and 'name' columns.")
+                        else:
+                            df_up.columns = [str(c).strip().lower() for c in df_up.columns]
+                            imported = 0
+                            errors = []
+                            for idx, row in df_up.iterrows():
+                                ok, msg = add_or_update_product(
+                                    sku=str(row.get("sku", "") if pd.notna(row.get("sku")) else ""),
+                                    name=str(row.get("name", "") if pd.notna(row.get("name")) else ""),
+                                    category=str(row.get("category", "General")) if pd.notna(row.get("category")) else "General",
+                                    unit_cost=safe_float(row.get("unit_cost"), 0.0),
+                                    selling_price=safe_float(row.get("selling_price"), 0.0),
+                                    stock_qty=safe_int(row.get("stock_qty"), 0),
+                                    reorder_level=safe_int(row.get("reorder_level"), 10),
+                                    actor=user["username"],
+                                )
+                                if ok:
+                                    imported += 1
+                                else:
+                                    errors.append(f"Row {idx + 1}: {msg}")
+
+                            log_audit(user["username"], "CSV_BULK_IMPORT", f"Imported {imported} rows")
+                            st.success(f"Imported/updated {imported} products.")
+                            if errors:
+                                st.warning("\n".join(errors))
+                            st.rerun()
+            except Exception as exc:
+                st.error(f"Could not read product CSV: {exc}")
+
+    with col_sales:
+        st.markdown("#### 2. Import Sales Against Stock CSV")
+        st.caption("Deducts sold quantities from matching `sku` stock and records `SALE` transactions. Optional: `unit_price`, `notes`.")
+
+        sample_sales_csv = (
+            "sku,quantity,unit_price,notes\n"
+            "SKU-1001,2,260.00,Batch Sale #1\n"
+            "SKU-1002,10,12.00,Batch Sale #2\n"
+        )
+        st.download_button(
+            label="Download Sample Sales Against Stock CSV",
+            data=sample_sales_csv,
+            file_name="sample_sales_against_stock.csv",
+            mime="text/csv",
+            key="dl_sample_sales_csv",
+        )
+
+        uploaded_sales = st.file_uploader("Choose Sales CSV file", type=["csv"], key="upload_sales_csv")
+        if uploaded_sales is not None:
+            try:
+                df_sales = pd.read_csv(uploaded_sales)
+                if df_sales.empty:
+                    st.warning("Uploaded sales CSV is empty.")
+                else:
+                    st.dataframe(df_sales.head(20), use_container_width=True, hide_index=True)
+
+                    if st.button("Process Sales Against Stock", type="primary", key="btn_import_sales_csv"):
+                        processed, errors = process_sales_against_stock_csv(df_sales, actor=user["username"])
+                        if processed > 0:
+                            st.success(f"Recorded {processed} sales against stock.")
+                        if errors:
+                            st.warning("\n".join(errors))
+                        if processed > 0:
+                            st.rerun()
+            except Exception as exc:
+                st.error(f"Could not read sales CSV: {exc}")
+
+
+def render_admin_tab(user: dict):
+    st.subheader("User Management & Audit Trail")
+
+    if user.get("role") != "admin":
+        st.error("Access denied: Administrator privileges are required.")
+        return
+
+    users_df = fetch_all_users()
+    st.markdown("#### Registered Users")
+    if not users_df.empty:
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+        user_map = {
+            f"@{r.get('username', '')} — {r.get('full_name', '')} ({r.get('role', 'staff')})": safe_int(r.get("id"))
+            for _, r in users_df.iterrows()
+        }
+        if user_map:
+            col_role, col_reset = st.columns(2)
+
+            with col_role:
+                st.markdown("##### Role & Account Status")
+                with st.form("manage_user_form"):
+                    target_label = st.selectbox("Select User to Manage", list(user_map.keys()), key="role_target_user")
+                    new_role = st.selectbox("Assign Role", ["staff", "admin"])
+                    new_active = st.checkbox("Active Account", value=True)
+                    apply_btn = st.form_submit_button("Save User Role & Status", type="primary", use_container_width=True)
+                    if apply_btn:
+                        ok, msg = update_user_role_or_status(
+                            user_id=user_map[target_label],
+                            role=new_role,
+                            is_active=new_active,
+                            actor_role=user.get("role", "staff"),
+                            actor=user["username"],
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+            with col_reset:
+                st.markdown("##### Reset User Password")
+                with st.form("admin_reset_password_form", clear_on_submit=True):
+                    reset_target_label = st.selectbox("Select User", list(user_map.keys()), key="reset_target_user")
+                    temp_pw = st.text_input("New / Temporary Password", type="password", placeholder="Min 6 characters")
+                    confirm_temp_pw = st.text_input("Confirm Password", type="password")
+                    reset_user_btn = st.form_submit_button("Reset Password", use_container_width=True)
+                    if reset_user_btn:
+                        if temp_pw != confirm_temp_pw:
+                            st.error("Passwords do not match.")
+                        else:
+                            ok, msg = admin_reset_user_password(
+                                target_user_id=user_map[reset_target_label],
+                                new_password=temp_pw,
+                                actor_role=user.get("role", "staff"),
+                                actor=user["username"],
+                            )
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+    else:
+        st.info("No users found.")
+
+    st.markdown("#### Recent Audit Logs")
+    logs_df = fetch_audit_logs(limit=100)
+    if not logs_df.empty:
+        st.dataframe(logs_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No audit entries recorded yet.")
+
+
+def render_main_app(user: dict):
+    """Render the main dashboard with role-gated tabs (staff: 2 tabs, admin: 5 tabs)."""
+    is_admin = user.get("role") == "admin"
+
+    with st.sidebar:
+        st.markdown(f"### {user.get('full_name') or user.get('username')}")
+        st.caption(f"@{user.get('username')} • Role: `{user.get('role', 'staff')}`")
+        days_window = st.selectbox("Analytics History Window", [7, 30, 90, 365], index=2)
+
+        with st.expander("Change Password"):
+            with st.form("change_password_form", clear_on_submit=True):
+                curr_pw = st.text_input("Current Password", type="password")
+                next_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
+                confirm_next_pw = st.text_input("Confirm New Password", type="password")
+                chg_btn = st.form_submit_button("Update Password", use_container_width=True)
+                if chg_btn:
+                    if next_pw != confirm_next_pw:
+                        st.error("New passwords do not match.")
+                    else:
+                        ok, msg = change_user_password(user["username"], curr_pw, next_pw)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+        if st.button("Sign Out", use_container_width=True):
+            log_audit(user["username"], "USER_LOGOUT", "Signed out")
+            st.session_state.pop("auth_user", None)
+            st.rerun()
+
+        st.divider()
+        st.caption(
+            f"**{DEVELOPER_COMPANY}**\n\n"
+            f"`{DEVELOPER_EMAIL}`\n\n"
+            f"© {_copyright_span()} {DEVELOPER_COMPANY}"
+        )
+
+    st.title("Enterprise AI Inventory & BI Command Centre")
+    maybe_show_daily_welcome(user)
+
+    products_df = fetch_products()
+    tx_df = fetch_transactions(days=int(days_window))
+
+    tab_labels = ["Overview & KPIs", "Inventory & Sales"]
+    if is_admin:
+        tab_labels.extend(["BI Analytics", "CSV Import", "Users & Audit Log"])
+
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
+        render_overview_tab(products_df, tx_df)
+
+    with tabs[1]:
+        render_inventory_tab(products_df, user)
+
+    if is_admin:
+        with tabs[2]:
+            render_bi_analytics_tab(products_df, tx_df)
+
+        with tabs[3]:
+            render_bulk_import_tab(user)
+
+        with tabs[4]:
+            render_admin_tab(user)
+
+    render_developer_footer()
+
+# ==============================================================================
+# 9. ENTRY POINT
 # ==============================================================================
 def main():
-    inject_responsive_styles()
     try:
         init_database_schema()
     except Exception as exc:
@@ -2346,3 +2419,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+        
