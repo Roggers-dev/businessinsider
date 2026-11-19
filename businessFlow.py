@@ -22,7 +22,7 @@ st.set_page_config(
 
 
 # ==============================================================================
-# 1. DATABASE CONNECTION & RETRY ENGINE
+# 1. BULLETPROOF DATABASE CONNECTION & RETRY ENGINE
 # ==============================================================================
 def get_neon_url() -> str:
     """Resolve the Neon Postgres connection URL safely from Streamlit secrets."""
