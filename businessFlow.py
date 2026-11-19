@@ -24,6 +24,74 @@ st.markdown(
     " Empowered by **Rogers Enterprises Limited | Ghana**."
 )
 
+
+# ---------------------------------------------------------
+# SHARED SAFE HELPERS
+# ---------------------------------------------------------
+def clean_text_cell(v):
+  if v is None:
+    return np.nan
+  try:
+    if pd.isna(v):
+      return np.nan
+  except Exception:
+    pass
+  cleaned = " ".join(str(v).strip().split())
+  return (
+      np.nan
+      if cleaned in {"", "nan", "NaN", "None", "none", "NULL", "null", "<NA>"}
+      else cleaned
+  )
+
+
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+  if s is None or len(s) == 0:
+    return pd.Series([], dtype="float64")
+  if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+    return pd.to_numeric(s, errors="coerce")
+  cleaned_str = (
+      s.apply(clean_text_cell)
+      .dropna()
+      .astype(str)
+      .str.replace(r"[,\sGHS$€£¥₦]", "", regex=True)
+      .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+      .str.strip()
+  )
+  out = pd.Series(np.nan, index=s.index, dtype="float64")
+  parsed = pd.to_numeric(cleaned_str, errors="coerce")
+  out.loc[parsed.index] = parsed
+  return out
+
+
+def find_col_case_insensitive(df: pd.DataFrame, target: str):
+  target_low = target.strip().lower()
+  for col in df.columns:
+    if str(col).strip().lower() == target_low:
+      return col
+  return None
+
+
+def load_any_tabular_file(uploaded_file, key_prefix="lab"):
+  name = str(uploaded_file.name).lower()
+  if name.endswith(".csv"):
+    for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
+      try:
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, encoding=enc)
+      except Exception:
+        continue
+    uploaded_file.seek(0)
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
+  else:
+    uploaded_file.seek(0)
+    xls = pd.ExcelFile(uploaded_file)
+    sheet_name = st.selectbox(
+        "Select Excel Sheet", xls.sheet_names, key=f"{key_prefix}_excel_sheet"
+    )
+    uploaded_file.seek(0)
+    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+
+
 # ---------------------------------------------------------
 # SIDEBAR DATA INPUTS & SETTINGS
 # ---------------------------------------------------------
@@ -43,7 +111,7 @@ st.sidebar.subheader("⚙️ Supply Chain Parameters")
 supplier_lead_time = st.sidebar.slider("Supplier Lead Time (Days)", 1, 30, 7)
 service_level_factor = st.sidebar.selectbox(
     "Service Level Safety Buffer", [1.28, 1.65, 2.05], index=1
-)  # 1.65 = 95% stockout protection
+)
 sales_growth_slider = st.sidebar.slider(
     "Demand Volatility / Growth Simulation (%)", -50, 100, 0, step=5
 )
@@ -53,268 +121,292 @@ if sales_file and stock_file:
     df_sales = pd.read_csv(sales_file)
     df_stock = pd.read_csv(stock_file)
 
-    # ---------------------------------------------------------
-    # ENTERPRISE DATA PROCESSING ENGINE
-    # ---------------------------------------------------------
-    df_sales["TotalRevenue"] = (
-        df_sales["QuantitySold"] * df_sales["UnitPrice"]
-    )
-    item_sales = (
-        df_sales.groupby("ItemName")
-        .agg({"QuantitySold": "sum", "TotalRevenue": "sum"})
-        .reset_index()
-    )
-    df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
-    df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0)
-    df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0)
+    item_col_sales = find_col_case_insensitive(df_sales, "ItemName")
+    qty_col_sales = find_col_case_insensitive(df_sales, "QuantitySold")
+    price_col_sales = find_col_case_insensitive(df_sales, "UnitPrice")
 
-    # Financial Metrics per SKU
-    if "SellingPrice" not in df_analysis.columns:
-      df_analysis["SellingPrice"] = (
-          df_analysis["CostPrice"] * 1.3
-      )  # Default 30% markup fallback
-    df_analysis["TotalPotentialRevenue"] = (
-        df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
-    )
-    df_analysis["CapitalTiedUp"] = (
-        df_analysis["CurrentStock"] * df_analysis["CostPrice"]
-    )
-    df_analysis["PotentialProfit"] = (
-        df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
-    )
+    item_col_stock = find_col_case_insensitive(df_stock, "ItemName")
+    curr_stock_col = find_col_case_insensitive(df_stock, "CurrentStock")
+    cost_price_col = find_col_case_insensitive(df_stock, "CostPrice")
+    sell_price_col = find_col_case_insensitive(df_stock, "SellingPrice")
+    phone_col_stock = find_col_case_insensitive(df_stock, "SupplierPhone")
 
-    # Demand Velocity & Simulation
-    days_analyzed = 30
-    base_velocity = df_analysis["QuantitySold"] / days_analyzed
-    df_analysis["SimulatedVelocity"] = base_velocity * (
-        1 + (sales_growth_slider / 100.0)
-    )
-
-    # ---------------------------------------------------------
-    # ADVANCED FEATURE 1: SAFETY STOCK & REORDER POINT (ROP)
-    # ---------------------------------------------------------
-    df_analysis["SafetyStock"] = (
-        df_analysis["SimulatedVelocity"]
-        * 0.2
-        * supplier_lead_time
-        * service_level_factor
-    ).apply(lambda x: max(1, int(round(x))))
-
-    df_analysis["ReorderPoint"] = (
-        df_analysis["SimulatedVelocity"] * supplier_lead_time
-        + df_analysis["SafetyStock"]
-    ).apply(lambda x: int(round(x)))
-
-    df_analysis["DaysLeft"] = df_analysis.apply(
-        lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
-        if row["SimulatedVelocity"] > 0
-        else 999,
-        axis=1,
-    )
-    today = datetime.now()
-    df_analysis["StockoutDate"] = df_analysis["DaysLeft"].apply(
-        lambda d: (today + timedelta(days=int(d))).strftime("%Y-%m-%d")
-        if d < 999
-        else "No Risk"
-    )
-
-    # ---------------------------------------------------------
-    # ADVANCED FEATURE 2: ABC PARETO INVENTORY CLASSIFICATION
-    # ---------------------------------------------------------
-    df_analysis = df_analysis.sort_values(
-        by="TotalRevenue", ascending=False
-    ).reset_index(drop=True)
-    df_analysis["CumulativeRevenue"] = df_analysis["TotalRevenue"].cumsum()
-    total_rev_sum = df_analysis["TotalRevenue"].sum()
-    if total_rev_sum > 0:
-      df_analysis["CumulativePct"] = (
-          df_analysis["CumulativeRevenue"] / total_rev_sum
+    if not all([item_col_sales, qty_col_sales, price_col_sales]):
+      st.error(
+          "Sales CSV must include ItemName, QuantitySold, and UnitPrice columns."
+      )
+    elif not all([item_col_stock, curr_stock_col, cost_price_col]):
+      st.error(
+          "Stock CSV must include ItemName, CurrentStock, and CostPrice"
+          " columns."
       )
     else:
-      df_analysis["CumulativePct"] = 0.0
+      df_sales = df_sales.copy()
+      df_stock = df_stock.copy()
+      df_sales["_item"] = df_sales[item_col_sales].apply(clean_text_cell)
+      df_sales["_qty"] = clean_numeric_series(df_sales[qty_col_sales]).fillna(0.0)
+      df_sales["_price"] = clean_numeric_series(
+          df_sales[price_col_sales]
+      ).fillna(0.0)
+      df_sales["TotalRevenue"] = df_sales["_qty"] * df_sales["_price"]
 
-    def classify_abc(pct):
-      if pct <= 0.80:
-        return "Class A (High Value - Strict Control)"
-      elif pct <= 0.95:
-        return "Class B (Moderate Value)"
+      item_sales = (
+          df_sales.dropna(subset=["_item"])
+          .groupby("_item", as_index=False)
+          .agg(QuantitySold=("_qty", "sum"), TotalRevenue=("TotalRevenue", "sum"))
+          .rename(columns={"_item": "ItemName"})
+      )
+
+      df_stock["ItemName"] = df_stock[item_col_stock].apply(clean_text_cell)
+      df_stock["CurrentStock"] = clean_numeric_series(
+          df_stock[curr_stock_col]
+      ).fillna(0.0)
+      df_stock["CostPrice"] = clean_numeric_series(
+          df_stock[cost_price_col]
+      ).fillna(0.0)
+      if sell_price_col:
+        df_stock["SellingPrice"] = clean_numeric_series(
+            df_stock[sell_price_col]
+        ).fillna(df_stock["CostPrice"] * 1.3)
       else:
-        return "Class C (Long-Tail / Bulk)"
+        df_stock["SellingPrice"] = df_stock["CostPrice"] * 1.3
+      if phone_col_stock:
+        df_stock["SupplierPhone"] = df_stock[phone_col_stock].apply(
+            clean_text_cell
+        )
 
-    df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(classify_abc)
+      df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
+      df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0.0)
+      df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0.0)
 
-    # ---------------------------------------------------------
-    # ADVANCED FEATURE 3: JUMIA/ALIBABA SKU PERFORMANCE TIERING
-    # ---------------------------------------------------------
-    def sku_tier(row):
-      if row["SimulatedVelocity"] >= 5:
-        return "🔥 Best Seller (Fast Moving)"
-      elif row["SimulatedVelocity"] >= 1:
-        return "⚡ Steady Mover"
-      elif row["CurrentStock"] > 10 and row["SimulatedVelocity"] < 0.2:
-        return "⚠️ Dead Stock / Capital Trap"
+      df_analysis["TotalPotentialRevenue"] = (
+          df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
+      )
+      df_analysis["CapitalTiedUp"] = (
+          df_analysis["CurrentStock"] * df_analysis["CostPrice"]
+      )
+      df_analysis["PotentialProfit"] = (
+          df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
+      )
+
+      days_analyzed = 30.0
+      base_velocity = df_analysis["QuantitySold"] / days_analyzed
+      df_analysis["SimulatedVelocity"] = base_velocity * (
+          1.0 + (sales_growth_slider / 100.0)
+      )
+
+      df_analysis["SafetyStock"] = (
+          df_analysis["SimulatedVelocity"]
+          * 0.2
+          * supplier_lead_time
+          * float(service_level_factor)
+      ).apply(lambda x: max(1, int(round(x))) if pd.notna(x) else 1)
+
+      df_analysis["ReorderPoint"] = (
+          df_analysis["SimulatedVelocity"] * supplier_lead_time
+          + df_analysis["SafetyStock"]
+      ).apply(lambda x: int(round(x)) if pd.notna(x) else 0)
+
+      df_analysis["DaysLeft"] = df_analysis.apply(
+          lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
+          if row["SimulatedVelocity"] > 0
+          else 999,
+          axis=1,
+      )
+      today = datetime.now()
+      df_analysis["StockoutDate"] = df_analysis["DaysLeft"].apply(
+          lambda d: (today + timedelta(days=int(min(d, 3650)))).strftime(
+              "%Y-%m-%d"
+          )
+          if pd.notna(d) and d < 999
+          else "No Risk"
+      )
+
+      df_analysis = df_analysis.sort_values(
+          by="TotalRevenue", ascending=False
+      ).reset_index(drop=True)
+      df_analysis["CumulativeRevenue"] = df_analysis["TotalRevenue"].cumsum()
+      total_rev_sum = float(df_analysis["TotalRevenue"].sum())
+      if total_rev_sum > 0:
+        df_analysis["CumulativePct"] = (
+            df_analysis["CumulativeRevenue"] / total_rev_sum
+        )
       else:
-        return "💤 Slow Moving"
+        df_analysis["CumulativePct"] = 0.0
 
-    df_analysis["SKU_Tier"] = df_analysis.apply(sku_tier, axis=1)
+      def classify_abc(pct):
+        if pct <= 0.80:
+          return "Class A (High Value - Strict Control)"
+        elif pct <= 0.95:
+          return "Class B (Moderate Value)"
+        else:
+          return "Class C (Long-Tail / Bulk)"
 
-    df_analysis["RecommendedOrderQty"] = df_analysis.apply(
-        lambda row: max(
-            0,
-            int(
-                round(
-                    (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
-                    - row["CurrentStock"]
-                )
-            ),
-        ),
-        axis=1,
-    )
-    df_analysis["EstimatedOrderCost"] = (
-        df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
-    )
-
-    # ---------------------------------------------------------
-    # EXECUTIVE KPI DASHBOARD
-    # ---------------------------------------------------------
-    st.markdown("### 📊 Enterprise Executive Performance Metrics")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric(
-        "Total Stock Capital", f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}"
-    )
-    col2.metric(
-        "Projected Gross Profit",
-        f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
-    )
-    col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
-    col4.metric(
-        "Class A Core Items",
-        len(df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]),
-    )
-    col5.metric(
-        "Dead Stock Traps",
-        len(df_analysis[df_analysis["SKU_Tier"].str.contains("Dead Stock")]),
-    )
-    st.markdown("---")
-
-    # ---------------------------------------------------------
-    # PLOTLY ENTERPRISE CHARTS
-    # ---------------------------------------------------------
-    col_ch1, col_ch2 = st.columns(2)
-    with col_ch1:
-      st.subheader("🌍 ABC Inventory Classification Breakdown")
-      fig_abc = px.pie(
-          df_analysis,
-          names="ABC_Category",
-          values="TotalRevenue",
-          color="ABC_Category",
-          color_discrete_map={
-              "Class A (High Value - Strict Control)": "#FF4B4B",
-              "Class B (Moderate Value)": "#FFA500",
-              "Class C (Long-Tail / Bulk)": "#2ECC71",
-          },
+      df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(
+          classify_abc
       )
-      st.plotly_chart(fig_abc, use_container_width=True)
-    with col_ch2:
-      st.subheader("⚡ SKU Velocity vs Stock Level (Jumia Matrix)")
-      fig_jumia = px.scatter(
-          df_analysis,
-          x="CurrentStock",
-          y="SimulatedVelocity",
-          color="SKU_Tier",
-          size="CapitalTiedUp",
-          hover_data=["ItemName", "DaysLeft"],
-      )
-      st.plotly_chart(fig_jumia, use_container_width=True)
-    st.markdown("---")
 
-    # ---------------------------------------------------------
-    # MASTER ENTERPRISE INVENTORY TABLE
-    # ---------------------------------------------------------
-    st.subheader("🔮 Master Enterprise Supply Chain & Replenishment Dashboard")
-    st.markdown(
-        "Items below incorporate **Safety Stock Buffers**, **Reorder Points"
-        " (ROP)**, and **ABC Pareto classification**:"
-    )
-    display_cols = [
-        "ItemName",
-        "ABC_Category",
-        "SKU_Tier",
-        "CurrentStock",
-        "SafetyStock",
-        "ReorderPoint",
-        "DaysLeft",
-        "StockoutDate",
-        "CapitalTiedUp",
-        "RecommendedOrderQty",
-        "EstimatedOrderCost",
-    ]
-    st.dataframe(df_analysis[display_cols], use_container_width=True)
+      def sku_tier(row):
+        if row["SimulatedVelocity"] >= 5:
+          return "🔥 Best Seller (Fast Moving)"
+        elif row["SimulatedVelocity"] >= 1:
+          return "⚡ Steady Mover"
+        elif row["CurrentStock"] > 10 and row["SimulatedVelocity"] < 0.2:
+          return "⚠️ Dead Stock / Capital Trap"
+        else:
+          return "💤 Slow Moving"
 
-    # ---------------------------------------------------------
-    # WHATSAPP ENTERPRISE PURCHASE ORDER DISPATCHER
-    # ---------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📱 Automated Enterprise WhatsApp Supplier Dispatcher")
-    reorder_needed_df = df_analysis[
-        df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
-    ]
-    if not reorder_needed_df.empty:
-      selected_sku = st.selectbox(
-          "Select SKU to Dispatch Purchase Order",
-          reorder_needed_df["ItemName"].tolist(),
+      df_analysis["SKU_Tier"] = df_analysis.apply(sku_tier, axis=1)
+
+      df_analysis["RecommendedOrderQty"] = df_analysis.apply(
+          lambda row: max(
+              0,
+              int(
+                  round(
+                      (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
+                      - row["CurrentStock"]
+                  )
+              ),
+          ),
+          axis=1,
       )
-      sku_row = reorder_needed_df[
-          reorder_needed_df["ItemName"] == selected_sku
-      ].iloc[0]
-      sup_phone = (
-          str(sku_row["SupplierPhone"])
-          if "SupplierPhone" in sku_row and pd.notna(sku_row["SupplierPhone"])
-          else "233000000000"
+      df_analysis["EstimatedOrderCost"] = (
+          df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
       )
-      order_msg = (
-          "Hello Supplier, automated reorder generated by AlufaTanaah"
-          f" Enterprise Suite. Item: *{sku_row['ItemName']}* | ABC Class:"
-          f" *{sku_row['ABC_Category'].split()[0]}* | Restock Quantity"
-          f" Required: *{sku_row['RecommendedOrderQty']} units* | Estimated PO"
-          f" Cost: *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
-          " fulfillment."
+
+      st.markdown("### 📊 Enterprise Executive Performance Metrics")
+      col1, col2, col3, col4, col5 = st.columns(5)
+      col1.metric(
+          "Total Stock Capital",
+          f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}",
       )
-      encoded_po = urllib.parse.quote(order_msg)
-      po_wa_url = f"https://wa.me/{sup_phone}?text={encoded_po}"
-      col_p1, col_p2 = st.columns([2, 1])
-      with col_p1:
-        st.info(
-            f"**Item:** {sku_row['ItemName']} | **Current Stock:**"
-            f" {sku_row['CurrentStock']} | **Reorder Point (ROP):**"
-            f" {sku_row['ReorderPoint']} | **Order Qty:**"
-            f" {sku_row['RecommendedOrderQty']} units"
+      col2.metric(
+          "Projected Gross Profit",
+          f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
+      )
+      col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
+      col4.metric(
+          "Class A Core Items",
+          len(
+              df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
+          ),
+      )
+      col5.metric(
+          "Dead Stock Traps",
+          len(df_analysis[df_analysis["SKU_Tier"].str.contains("Dead Stock")]),
+      )
+      st.markdown("---")
+
+      col_ch1, col_ch2 = st.columns(2)
+      with col_ch1:
+        st.subheader("🌍 ABC Inventory Classification Breakdown")
+        fig_abc = px.pie(
+            df_analysis,
+            names="ABC_Category",
+            values="TotalRevenue",
+            color="ABC_Category",
+            color_discrete_map={
+                "Class A (High Value - Strict Control)": "#FF4B4B",
+                "Class B (Moderate Value)": "#FFA500",
+                "Class C (Long-Tail / Bulk)": "#2ECC71",
+            },
         )
-      with col_p2:
-        st.markdown(
-            f'<a href="{po_wa_url}" target="_blank" style="display:block;'
-            " text-align:center; background-color:#25D366; color:white;"
-            " padding:12px 15px; border-radius:6px; text-decoration:none;"
-            ' font-weight:bold; font-size:14px;">💬 Send WhatsApp PO</a>',
-            unsafe_allow_html=True,
+        st.plotly_chart(fig_abc, use_container_width=True)
+      with col_ch2:
+        st.subheader("⚡ SKU Velocity vs Stock Level (Jumia Matrix)")
+        fig_jumia = px.scatter(
+            df_analysis,
+            x="CurrentStock",
+            y="SimulatedVelocity",
+            color="SKU_Tier",
+            size="CapitalTiedUp",
+            hover_data=["ItemName", "DaysLeft"],
         )
-    else:
-      st.success(
-          "🎉 All inventory SKUs are safely above their Reorder Points (ROP)!"
-      )
+        st.plotly_chart(fig_jumia, use_container_width=True)
+      st.markdown("---")
 
-    # ---------------------------------------------------------
-    # EXPORT REPORT
-    # ---------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📥 Export Enterprise Intelligence Report")
-    csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Enterprise Inventory & ABC Report (CSV)",
-        data=csv_bytes,
-        file_name="enterprise_bi_inventory_report.csv",
-        mime="text/csv",
-    )
+      st.subheader(
+          "🔮 Master Enterprise Supply Chain & Replenishment Dashboard"
+      )
+      display_cols = [
+          c
+          for c in [
+              "ItemName",
+              "ABC_Category",
+              "SKU_Tier",
+              "CurrentStock",
+              "SafetyStock",
+              "ReorderPoint",
+              "DaysLeft",
+              "StockoutDate",
+              "CapitalTiedUp",
+              "RecommendedOrderQty",
+              "EstimatedOrderCost",
+          ]
+          if c in df_analysis.columns
+      ]
+      st.dataframe(df_analysis[display_cols], use_container_width=True)
+
+      st.markdown("---")
+      st.subheader("📱 Automated Enterprise WhatsApp Supplier Dispatcher")
+      reorder_needed_df = df_analysis[
+          df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
+      ]
+      if not reorder_needed_df.empty:
+        selected_sku = st.selectbox(
+            "Select SKU to Dispatch Purchase Order",
+            reorder_needed_df["ItemName"].dropna().astype(str).tolist(),
+        )
+        sku_row = reorder_needed_df[
+            reorder_needed_df["ItemName"] == selected_sku
+        ].iloc[0]
+        raw_phone = (
+            sku_row["SupplierPhone"]
+            if "SupplierPhone" in sku_row and pd.notna(sku_row["SupplierPhone"])
+            else "233000000000"
+        )
+        digits_only = "".join(ch for ch in str(raw_phone) if ch.isdigit())
+        sup_phone = digits_only if digits_only else "233000000000"
+        order_msg = (
+            "Hello Supplier, automated reorder generated by AlufaTanaah"
+            f" Enterprise Suite. Item: *{sku_row['ItemName']}* | ABC Class:"
+            f" *{str(sku_row['ABC_Category']).split()[0]}* | Restock Quantity"
+            f" Required: *{sku_row['RecommendedOrderQty']} units* | Estimated PO"
+            f" Cost: *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
+            " fulfillment."
+        )
+        encoded_po = urllib.parse.quote(order_msg)
+        po_wa_url = f"https://wa.me/{sup_phone}?text={encoded_po}"
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+          st.info(
+              f"**Item:** {sku_row['ItemName']} | **Current Stock:**"
+              f" {sku_row['CurrentStock']} | **Reorder Point (ROP):**"
+              f" {sku_row['ReorderPoint']} | **Order Qty:**"
+              f" {sku_row['RecommendedOrderQty']} units"
+          )
+        with col_p2:
+          st.markdown(
+              f'<a href="{po_wa_url}" target="_blank" style="display:block;'
+              " text-align:center; background-color:#25D366; color:white;"
+              " padding:12px 15px; border-radius:6px; text-decoration:none;"
+              ' font-weight:bold; font-size:14px;">💬 Send WhatsApp PO</a>',
+              unsafe_allow_html=True,
+          )
+      else:
+        st.success(
+            "🎉 All inventory SKUs are safely above their Reorder Points (ROP)!"
+        )
+
+      st.markdown("---")
+      st.subheader("📥 Export Enterprise Intelligence Report")
+      csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
+      st.download_button(
+          label="Download Enterprise Inventory & ABC Report (CSV)",
+          data=csv_bytes,
+          file_name="enterprise_bi_inventory_report.csv",
+          mime="text/csv",
+      )
   except Exception as e:
     st.error(f"Error processing files: {e}")
 else:
@@ -340,78 +432,43 @@ st.markdown(
 )
 
 
-def load_any_tabular_file(uploaded_file):
-  name = uploaded_file.name.lower()
-  if name.endswith(".csv"):
-    for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
-      try:
-        uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file, encoding=enc)
-      except Exception:
-        continue
-    uploaded_file.seek(0)
-    return pd.read_csv(uploaded_file, sep=None, engine="python")
-  else:
-    uploaded_file.seek(0)
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_name = st.selectbox(
-        "Select Excel Sheet", xls.sheet_names, key="lab_excel_sheet"
-    )
-    uploaded_file.seek(0)
-    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
-
-
-def clean_numeric_series(s: pd.Series) -> pd.Series:
-  if pd.api.types.is_numeric_dtype(s):
-    return pd.to_numeric(s, errors="coerce")
-  cleaned_str = (
-      s.astype(str)
-      .str.replace(r"[,\sGHS$€£¥₦]", "", regex=True)
-      .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
-      .str.strip()
-  )
-  return pd.to_numeric(cleaned_str, errors="coerce")
-
-
 def detect_abnormalities(df: pd.DataFrame):
   flags = []
-  dup_count = int(df.duplicated().sum())
-  if dup_count > 0:
-    flags.append({
-        "Severity": "🚨 Danger",
-        "Type": "Duplicate Rows",
-        "Target": "All Columns",
-        "Detail": f"{dup_count} exact duplicate row(s) detected.",
-    })
+  if df.empty:
+    return pd.DataFrame(flags)
+
+  try:
+    dup_count = int(df.duplicated().sum())
+    if dup_count > 0:
+      flags.append({
+          "Severity": "🚨 Danger",
+          "Type": "Duplicate Rows",
+          "Target": "All Columns",
+          "Detail": f"{dup_count} exact duplicate row(s) detected.",
+      })
+  except Exception:
+    pass
 
   for col in df.columns:
-    missing_cnt = int(df[col].isna().sum())
-    blank_str_cnt = (
-        int(
-            df[col]
-            .astype(str)
-            .str.strip()
-            .isin(["", "nan", "NaN", "None", "NULL", "null"])
-            .sum()
-        )
-        - missing_cnt
-    )
-    blank_str_cnt = max(0, blank_str_cnt)
+    s_col = df[col]
+    missing_cnt = int(s_col.isna().sum())
+    cleaned_cells = s_col.apply(clean_text_cell)
+    blank_str_cnt = max(0, int(cleaned_cells.isna().sum()) - missing_cnt)
+
     if missing_cnt > 0 or blank_str_cnt > 0:
       flags.append({
           "Severity": "⚠️ Warning",
           "Type": "Missing / Blank Values",
-          "Target": col,
+          "Target": str(col),
           "Detail": (
               f"{missing_cnt} null(s) and {blank_str_cnt} blank text entry(ies)."
           ),
       })
 
-    num_try = clean_numeric_series(df[col])
+    num_try = clean_numeric_series(s_col)
+    non_blank_cnt = int(cleaned_cells.notna().sum())
     valid_ratio = (
-        num_try.notna().sum() / max(1, len(df[col].dropna()))
-        if len(df[col].dropna()) > 0
-        else 0
+        (num_try.notna().sum() / non_blank_cnt) if non_blank_cnt > 0 else 0.0
     )
     if valid_ratio >= 0.6:
       neg_cnt = int((num_try < 0).sum())
@@ -420,7 +477,7 @@ def detect_abnormalities(df: pd.DataFrame):
         flags.append({
             "Severity": "🚨 Danger",
             "Type": "Negative Values",
-            "Target": col,
+            "Target": str(col),
             "Detail": (
                 f"{neg_cnt} negative value(s) found (check for losses, returns,"
                 " or entry errors)."
@@ -430,13 +487,13 @@ def detect_abnormalities(df: pd.DataFrame):
         flags.append({
             "Severity": "⚠️ Notice",
             "Type": "Zero Values",
-            "Target": col,
+            "Target": str(col),
             "Detail": f"{zero_cnt} zero value(s) detected.",
         })
       non_null_num = num_try.dropna()
       if len(non_null_num) >= 4:
         q1, q3 = np.percentile(non_null_num, [25, 75])
-        iqr = q3 - q1
+        iqr = float(q3 - q1)
         if iqr > 0:
           outliers = non_null_num[
               (non_null_num < q1 - 1.5 * iqr)
@@ -446,26 +503,26 @@ def detect_abnormalities(df: pd.DataFrame):
             flags.append({
                 "Severity": "🚨 Abnormality",
                 "Type": "Statistical Outliers (IQR)",
-                "Target": col,
+                "Target": str(col),
                 "Detail": (
                     f"{len(outliers)} extreme value(s) outside"
                     f" [{q1 - 1.5 * iqr:,.2f}, {q3 + 1.5 * iqr:,.2f}]."
                 ),
             })
 
-    if any(k in col.lower() for k in ["date", "time", "dt", "day", "month"]):
-      parsed_dates = pd.to_datetime(df[col], errors="coerce")
-      failed_dates = (
-          int(parsed_dates.isna().sum()) - missing_cnt - blank_str_cnt
+    if any(k in str(col).lower() for k in ["date", "time", "dt", "day", "month"]):
+      parsed_dates = pd.to_datetime(cleaned_cells, errors="coerce")
+      failed_dates = max(
+          0, int(parsed_dates.isna().sum()) - int(cleaned_cells.isna().sum())
       )
-      if max(0, failed_dates) > 0:
+      if failed_dates > 0:
         flags.append({
             "Severity": "⚠️ Format Issue",
             "Type": "Unstandardized / Invalid Dates",
-            "Target": col,
+            "Target": str(col),
             "Detail": (
-                f"{max(0, failed_dates)} entry(ies) could not be cleanly parsed"
-                " as dates."
+                f"{failed_dates} entry(ies) could not be cleanly parsed as"
+                " dates."
             ),
         })
 
@@ -482,23 +539,30 @@ if lab_file is not None:
   file_sig = f"{lab_file.name}_{lab_file.size}"
   if st.session_state.get("lab_file_sig") != file_sig:
     st.session_state["lab_file_sig"] = file_sig
-    st.session_state["lab_working_df"] = load_any_tabular_file(lab_file)
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
     st.session_state["lab_fix_highlights"] = []
 
   if "lab_working_df" not in st.session_state:
-    st.session_state["lab_working_df"] = load_any_tabular_file(lab_file)
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
     st.session_state["lab_fix_highlights"] = []
 
   work_df = st.session_state["lab_working_df"].copy()
 
-  # Summary strip
   k1, k2, k3, k4 = st.columns(4)
   k1.metric("Rows", f"{len(work_df):,}")
   k2.metric("Columns", f"{len(work_df.columns):,}")
   k3.metric("Missing Cells", f"{int(work_df.isna().sum().sum()):,}")
-  k4.metric("Duplicate Rows", f"{int(work_df.duplicated().sum()):,}")
+  try:
+    dup_total = int(work_df.duplicated().sum())
+  except Exception:
+    dup_total = 0
+  k4.metric("Duplicate Rows", f"{dup_total:,}")
 
-  # 1. DANGERS & ABNORMALITIES SCANNER
+    # 1. DANGERS & ABNORMALITIES SCANNER
   st.subheader("🚨 Dangers & Abnormalities Scanner")
   df_flags = detect_abnormalities(work_df)
   if not df_flags.empty:
@@ -509,7 +573,7 @@ if lab_file is not None:
         " abnormalities detected."
     )
 
-      # 2. PROMPT AREAS NEEDING FORMATTING + CLEAN / DO NOT CLEAN COMMANDS
+  # 2. PROMPT AREAS NEEDING FORMATTING + CLEAN / DO NOT CLEAN COMMANDS
   st.subheader("🧭 Formatting Prompts & Action Commands")
   st.caption(
       "Review areas prompted for formatting and choose **Clean & Format** or"
@@ -527,8 +591,7 @@ if lab_file is not None:
   numeric_candidate_cols = []
   for c in text_cols:
     num_s = clean_numeric_series(work_df[c])
-    non_blank = work_df[c].dropna().astype(str).str.strip()
-    non_blank = non_blank[non_blank != ""]
+    non_blank = work_df[c].apply(clean_text_cell).dropna()
     if len(non_blank) > 0 and (num_s.notna().sum() / len(non_blank)) >= 0.7:
       numeric_candidate_cols.append(c)
 
@@ -557,7 +620,7 @@ if lab_file is not None:
     cmd_num_parse = (
         st.radio(
             "3. Currency / Comma-Formatted Numeric Text"
-            f" ({', '.join(numeric_candidate_cols[:4])}):",
+            f" ({', '.join(str(x) for x in numeric_candidate_cols[:4])}):",
             ["Clean & Format to Numbers", "Do Not Clean (Keep as text)"],
             index=0,
             horizontal=True,
@@ -593,14 +656,7 @@ if lab_file is not None:
             work_df[c].dtype == object
             or pd.api.types.is_string_dtype(work_df[c])
         ):
-          work_df[c] = (
-              work_df[c]
-              .astype(str)
-              .apply(lambda v: " ".join(v.strip().split()))
-              .replace(
-                  {"nan": np.nan, "None": np.nan, "NULL": np.nan, "": np.nan}
-              )
-          )
+          work_df[c] = work_df[c].apply(clean_text_cell)
       applied_notes.append(
           "Trimmed extra whitespace and standardized blank text markers across"
           " text columns."
@@ -634,7 +690,7 @@ if lab_file is not None:
       (
           i
           for i, c in enumerate(date_col_candidates)
-          if any(k in c.lower() for k in ["date", "time", "dt", "day"])
+          if any(k in str(c).lower() for k in ["date", "time", "dt", "day"])
       ),
       0,
   )
@@ -658,13 +714,15 @@ if lab_file is not None:
     )
 
   if format_date_btn:
-    parsed = pd.to_datetime(work_df[selected_date_col], errors="coerce")
+    cleaned_d = work_df[selected_date_col].apply(clean_text_cell)
+    parsed = pd.to_datetime(cleaned_d, errors="coerce")
     valid_parsed = int(parsed.notna().sum())
-    work_df[selected_date_col] = np.where(
-        parsed.notna(),
-        parsed.dt.strftime(target_date_fmt),
-        work_df[selected_date_col].astype(str),
+    formatted_series = cleaned_d.astype(object)
+    valid_mask = parsed.notna()
+    formatted_series.loc[valid_mask] = parsed.loc[valid_mask].dt.strftime(
+        target_date_fmt
     )
+    work_df[selected_date_col] = formatted_series
     st.session_state["lab_working_df"] = work_df
     note = (
         f"Formatted column **'{selected_date_col}'** to `{target_date_fmt}`"
@@ -683,8 +741,7 @@ if lab_file is not None:
 
   st.dataframe(work_df, use_container_width=True)
 
-  # 5. SWIFT MEASUREMENTS (MEAN, AVERAGE, MEDIAN, COUNT, COUNTA, COUNTIFS)
-  #    & REGRESSION CALCULATOR
+  # 5. SWIFT MEASUREMENTS & REGRESSION CALCULATOR
   st.markdown("---")
   st.subheader(
       "📐 Swift Measurements & Regression Calculator (Mean, Average, Median,"
@@ -694,7 +751,10 @@ if lab_file is not None:
   numeric_cols_now = [
       c
       for c in work_df.columns
-      if pd.api.types.is_numeric_dtype(work_df[c])
+      if (
+          pd.api.types.is_numeric_dtype(work_df[c])
+          and not pd.api.types.is_bool_dtype(work_df[c])
+      )
       or clean_numeric_series(work_df[c]).notna().sum() > 0
   ]
 
@@ -705,27 +765,18 @@ if lab_file is not None:
         key="swift_target_col",
     )
     num_series = clean_numeric_series(work_df[swift_col])
-    non_empty_counta = int(
-        work_df[swift_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .replace({"": np.nan, "nan": np.nan, "None": np.nan})
-        .dropna()
-        .count()
-    )
+    non_empty_counta = int(work_df[swift_col].apply(clean_text_cell).notna().sum())
     numeric_count = int(num_series.notna().sum())
     mean_val = float(num_series.mean()) if numeric_count > 0 else 0.0
     median_val = float(num_series.median()) if numeric_count > 0 else 0.0
 
-    # COUNTIFS multi-condition filter
     st.markdown("**COUNTIFS Multi-Condition Counter**")
     cf1, cf2, cf3, cf4 = st.columns(4)
     cond1_col = cf1.selectbox(
         "Condition 1 Column", work_df.columns, key="cifs_col1"
     )
     cond1_val = cf2.text_input(
-        "Condition 1 Value (contains/equals)", key="cifs_val1"
+        "Condition 1 Value (equals)", key="cifs_val1"
     ).strip()
     cond2_col = cf3.selectbox(
         "Condition 2 Column", work_df.columns, key="cifs_col2"
@@ -737,12 +788,20 @@ if lab_file is not None:
     mask_cifs = pd.Series(True, index=work_df.index)
     if cond1_val:
       mask_cifs = mask_cifs & (
-          work_df[cond1_col].astype(str).str.strip().str.lower()
+          work_df[cond1_col]
+          .apply(clean_text_cell)
+          .fillna("")
+          .astype(str)
+          .str.lower()
           == cond1_val.lower()
       )
     if cond2_val:
       mask_cifs = mask_cifs & (
-          work_df[cond2_col].astype(str).str.strip().str.lower()
+          work_df[cond2_col]
+          .apply(clean_text_cell)
+          .fillna("")
+          .astype(str)
+          .str.lower()
           == cond2_val.lower()
       )
     countifs_result = int(mask_cifs.sum()) if (cond1_val or cond2_val) else 0
@@ -755,7 +814,6 @@ if lab_file is not None:
     s5.metric("COUNTA (Non-Empty)", f"{non_empty_counta:,}")
     s6.metric("COUNTIFS", f"{countifs_result:,}")
 
-    # Linear Regression Calculator
     st.markdown("---")
     st.markdown("**📈 Linear Regression Calculator ($Y = mX + b$)**")
     if len(numeric_cols_now) >= 2:
@@ -781,7 +839,7 @@ if lab_file is not None:
         y_pred = slope * reg_df["x"] + intercept
         ss_res = np.sum((reg_df["y"] - y_pred) ** 2)
         ss_tot = np.sum((reg_df["y"] - reg_df["y"].mean()) ** 2)
-        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        r_squared = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
 
         predict_x = rc3.number_input(
             f"Predict {y_col} for {x_col} =",
@@ -815,8 +873,8 @@ if lab_file is not None:
             )
         )
         fig_reg.update_layout(
-            xaxis_title=x_col,
-            yaxis_title=y_col,
+            xaxis_title=str(x_col),
+            yaxis_title=str(y_col),
             title=f"Regression Trend: {y_col} vs {x_col}",
         )
         st.plotly_chart(fig_reg, use_container_width=True)
@@ -846,25 +904,34 @@ if lab_file is not None:
         key="ai_diag_col",
     )
     horizon_steps = ai_col2.slider(
-        "Future Periods Ahead", min_value=1, max_value=30, value=7, key="ai_horizon"
+        "Future Periods Ahead",
+        min_value=1,
+        max_value=30,
+        value=7,
+        key="ai_horizon",
     )
 
-    diag_series = clean_numeric_series(work_df[diag_target_col]).dropna().reset_index(drop=True)
+    diag_series = (
+        clean_numeric_series(work_df[diag_target_col])
+        .dropna()
+        .reset_index(drop=True)
+    )
     total_cells = max(1, len(work_df) * max(1, len(work_df.columns)))
     missing_pct = (int(work_df.isna().sum().sum()) / total_cells) * 100.0
-    dup_pct = (int(work_df.duplicated().sum()) / max(1, len(work_df))) * 100.0
+    dup_pct = (dup_total / max(1, len(work_df))) * 100.0
 
-    # Compute AI Health Score
-    health_score = 100.0 - min(40.0, missing_pct * 1.5) - min(25.0, dup_pct * 2.0)
+    health_score = (
+        100.0 - min(40.0, missing_pct * 1.5) - min(25.0, dup_pct * 2.0)
+    )
     if len(diag_series) >= 4:
       q1_d, q3_d = np.percentile(diag_series, [25, 75])
-      iqr_d = q3_d - q1_d
+      iqr_d = float(q3_d - q1_d)
       if iqr_d > 0:
         out_ratio = (
             (diag_series < q1_d - 1.5 * iqr_d)
             | (diag_series > q3_d + 1.5 * iqr_d)
         ).mean() * 100.0
-        health_score -= min(25.0, out_ratio * 1.5)
+        health_score -= min(25.0, float(out_ratio) * 1.5)
     health_score = max(0.0, min(100.0, health_score))
 
     if len(diag_series) >= 2:
@@ -888,16 +955,13 @@ if lab_file is not None:
       d1, d2, d3, d4 = st.columns(4)
       d1.metric("AI Data Health Score", f"{health_score:.0f} / 100")
       d2.metric("Future Direction", outlook_label)
-      d3.metric(
-          f"Avg Next {horizon_steps} Periods", f"{avg_future:,.2f}"
-      )
+      d3.metric(f"Avg Next {horizon_steps} Periods", f"{avg_future:,.2f}")
       d4.metric(
           f"Period +{horizon_steps} Forecast",
           f"{end_future:,.2f}",
           delta=f"{end_future - current_last:+,.2f} vs latest",
       )
 
-      # AI Diagnostic Notes
       st.markdown("**🧠 AI Diagnostic Findings & Future Watchpoints:**")
       if missing_pct > 5:
         st.warning(
@@ -929,7 +993,6 @@ if lab_file is not None:
             " averages."
         )
 
-      # Future Trajectory Chart
       hist_df = pd.DataFrame({
           "Step": np.arange(1, len(diag_series) + 1),
           "Value": diag_series.values,
@@ -966,11 +1029,10 @@ if lab_file is not None:
         " numbers are stored as text."
     )
 
-      # Export cleaned lab dataset
   st.download_button(
       label="📥 Download Cleaned & Formatted Data (CSV)",
       data=work_df.to_csv(index=False).encode("utf-8"),
-      file_name=f"cleaned_{lab_file.name.rsplit('.', 1)[0]}.csv",
+      file_name=f"cleaned_{str(lab_file.name).rsplit('.', 1)[0]}.csv",
       mime="text/csv",
       key="lab_download_cleaned",
   )
