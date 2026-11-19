@@ -186,6 +186,35 @@ def verify_password(password: str, stored_hash: str | None) -> bool:
 # ==============================================================================
 # 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
 # ==============================================================================
+def _relax_extra_not_null_columns(cur, table_name: str = "users", managed_cols: set[str] | None = None):
+    """Allow legacy extra columns without defaults to accept NULLs so inserts never fail."""
+    managed = managed_cols or {
+        "id", "username", "full_name", "role", "password_hash",
+        "is_active", "reset_token", "reset_expires_at", "created_at",
+    }
+    try:
+        cur.execute(
+            """
+            SELECT column_name, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s;
+            """,
+            (table_name,),
+        )
+        for col in cur.fetchall():
+            col_name = str(col.get("column_name") or "")
+            if not col_name or col_name in managed:
+                continue
+            if str(col.get("is_nullable") or "").upper() == "NO" and col.get("column_default") is None:
+                _try_step(
+                    cur,
+                    f'ALTER TABLE "{table_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;',
+                    step_name=f"drop_not_null_{table_name}_{col_name}",
+                )
+    except Exception as exc:
+        logger.warning("Could not relax extra columns on %s: %s", table_name, exc)
+
+
 def _apply_schema_and_seed(cur):
     _try_step(
         cur,
@@ -303,6 +332,8 @@ def _apply_schema_and_seed(cur):
         ("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "add_created_at"),
     ]:
         _try_step(cur, ddl, step_name=label)
+
+    _relax_extra_not_null_columns(cur, "users")
 
     _try_step(
         cur,
@@ -460,6 +491,7 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
     now_ts = utc_now()
 
     def _op(cur):
+        _relax_extra_not_null_columns(cur, "users")
         cur.execute(
             """
             INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
@@ -488,6 +520,7 @@ def _sync_default_admin(password: str) -> dict:
     now_ts = utc_now()
 
     def _op(cur):
+        _relax_extra_not_null_columns(cur, "users")
         cur.execute(
             """
             UPDATE users
