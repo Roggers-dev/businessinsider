@@ -1,2425 +1,1549 @@
+from datetime import datetime, timedelta
 import hashlib
+import hmac
+import os
+import secrets
+import sqlite3
+import urllib.parse
 import io
 import logging
 import secrets
-from datetime import date, datetime, timedelta, timezone
-
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import psycopg2
-from psycopg2 import InterfaceError, OperationalError, extras
+import plotly.graph_objects as go
 import streamlit as st
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("businessFlow")
-
-RECOVERY_TOKEN_TTL_MINUTES = 2
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "Admin@1234"
-
-DEVELOPER_COMPANY = "Roggers Enterprises Limited | Ghana"
-DEVELOPER_EMAIL = "koffieroggers@gmail.com"
-DEVELOPER_HANDLE = "ROG3RS"
-DEVELOPER_GITHUB = "Roggers-dev"
-
+# ---------------------------------------------------------
+# PAGE CONFIGURATION
+# ---------------------------------------------------------
 st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
-    page_icon="📊",
+    page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ==============================================================================
-# 1. BULLETPROOF DATABASE CONNECTION & RETRY ENGINE
-# ==============================================================================
-def get_neon_url() -> str:
-    """Resolve the Neon Postgres connection URL safely from Streamlit secrets."""
-    try:
-        if "neon" in st.secrets and "database_url" in st.secrets["neon"]:
-            url = str(st.secrets["neon"]["database_url"]).strip()
-            if url:
-                return url
-        if "database_url" in st.secrets:
-            url = str(st.secrets["database_url"]).strip()
-            if url:
-                return url
-    except Exception as exc:
-        raise RuntimeError(f"Unable to read Streamlit secrets: {exc}") from exc
-
-    raise RuntimeError(
-        "Missing Neon connection string. Set [neon] database_url in Streamlit Secrets."
-    )
+AUTH_DB_PATH = os.environ.get("ENTERPRISE_AUTH_DB", "enterprise_auth.db")
+MAX_LOGIN_ATTEMPTS = 5
 
 
-def _normalize_neon_url(url: str) -> str:
-    cleaned = url.strip()
-    if "sslmode=" not in cleaned:
-        sep = "&" if "?" in cleaned else "?"
-        cleaned = f"{cleaned}{sep}sslmode=require"
-    if "connect_timeout=" not in cleaned:
-        sep = "&" if "?" in cleaned else "?"
-        cleaned = f"{cleaned}{sep}connect_timeout=10"
-    return cleaned
+# ---------------------------------------------------------
+# AUTHENTICATION & SECURITY HELPERS (PBKDF2 + SQLITE)
+# ---------------------------------------------------------
+def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+  """Hash a password using PBKDF2-HMAC-SHA256 and a random salt."""
+  salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+  digest = hashlib.pbkdf2_hmac(
+      "sha256",
+      password.encode("utf-8"),
+      salt,
+      200_000,
+  )
+  return salt.hex(), digest.hex()
 
 
-def open_connection(retries: int = 2):
-    """Open a Postgres connection with retry support for transient Neon cold-starts."""
-    url = _normalize_neon_url(get_neon_url())
-    last_exc = None
-    for attempt in range(retries + 1):
-        try:
-            return psycopg2.connect(url)
-        except (OperationalError, InterfaceError) as exc:
-            last_exc = exc
-            logger.warning("Postgres connection attempt %s failed: %s", attempt + 1, exc)
-    raise last_exc  # type: ignore[misc]
+def verify_password(password: str, salt_hex: str, expected_hash_hex: str) -> bool:
+  """Verify a password in constant time."""
+  if not password or not salt_hex or not expected_hash_hex:
+    return False
+  _, actual_hash_hex = hash_password(password, salt_hex)
+  return hmac.compare_digest(actual_hash_hex, expected_hash_hex)
 
 
-def run_read_query(sql: str, params: tuple | list | None = None) -> pd.DataFrame:
-    """Execute a read query safely and always close the connection."""
-    conn = None
-    try:
-        conn = open_connection(retries=2)
-        with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-            cur.execute(sql, params or ())
-            rows = cur.fetchall()
-        if not rows:
-            return pd.DataFrame()
-        return pd.DataFrame([dict(r) for r in rows])
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+def validate_password_strength(password: str) -> list[str]:
+  """Return a list of unmet password rules for clear user guidance."""
+  issues = []
+  if len(password) < 8:
+    issues.append("At least 8 characters long")
+  if not any(ch.isupper() for ch in password):
+    issues.append("At least one uppercase letter (A-Z)")
+  if not any(ch.islower() for ch in password):
+    issues.append("At least one lowercase letter (a-z)")
+  if not any(ch.isdigit() for ch in password):
+    issues.append("At least one number (0-9)")
+  return issues
 
 
-def run_write_tx(fn):
-    """Execute a transactional write callback with automatic commit/rollback and retry on disconnect."""
-    last_exc = None
-    for attempt in range(2):
-        conn = None
-        try:
-            conn = open_connection(retries=1)
-            with conn:
-                with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-                    result = fn(cur)
-            return result
-        except (OperationalError, InterfaceError) as exc:
-            last_exc = exc
-            logger.warning("Transient DB write error on attempt %s: %s", attempt + 1, exc)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    raise last_exc  # type: ignore[misc]
-
-
-def _try_step(cur, sql: str, params: tuple | list | None = None, step_name: str = "step"):
-    """Run a single DDL/DML statement inside a SAVEPOINT so one legacy quirk doesn't abort the tx."""
-    sp = "sp_schema_guard"
-    cur.execute(f"SAVEPOINT {sp};")
-    try:
-        cur.execute(sql, params or ())
-        cur.execute(f"RELEASE SAVEPOINT {sp};")
-    except Exception as exc:
-        cur.execute(f"ROLLBACK TO SAVEPOINT {sp};")
-        logger.warning("Schema step '%s' skipped/adjusted: %s", step_name, exc)
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def safe_float(val, default: float = 0.0) -> float:
-    try:
-        if val is None or pd.isna(val):
-            return default
-        return float(val)
-    except Exception:
-        return default
-
-
-def safe_int(val, default: int = 0) -> int:
-    try:
-        if val is None or pd.isna(val):
-            return default
-        return int(float(val))
-    except Exception:
-        return default
-
-
-# ==============================================================================
-# 2. PASSWORD HASHING & AUTHENTICATION
-# ==============================================================================
-def hash_password(password: str, salt: str | None = None) -> str:
-    if salt is None:
-        salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        120_000,
-    ).hex()
-    return f"{salt}${digest}"
-
-
-def verify_password(password: str, stored_hash: str | None) -> bool:
-    if not stored_hash or "$" not in stored_hash:
-        return False
-    try:
-        salt, expected_digest = stored_hash.split("$", 1)
-        actual_digest = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt.encode("utf-8"),
-            120_000,
-        ).hex()
-        return secrets.compare_digest(actual_digest, expected_digest)
-    except Exception:
-        return False
-
-
-# ==============================================================================
-# 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
-# ==============================================================================
-def _get_table_columns(cur, table_name: str) -> set[str]:
-    try:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s;
-            """,
-            (table_name,),
-        )
-        return {str(r["column_name"]) for r in cur.fetchall() if r.get("column_name")}
-    except Exception as exc:
-        logger.warning("Could not inspect %s columns: %s", table_name, exc)
-        return set()
-
-
-def _relax_extra_not_null_columns(cur, table_name: str, managed_cols: set[str]):
-    """Allow legacy extra columns without defaults to accept NULLs so inserts never fail."""
-    try:
-        cur.execute(
-            """
-            SELECT column_name, is_nullable, column_default
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s;
-            """,
-            (table_name,),
-        )
-        for col in cur.fetchall():
-            col_name = str(col.get("column_name") or "")
-            if not col_name or col_name in managed_cols:
-                continue
-            if str(col.get("is_nullable") or "").upper() == "NO" and col.get("column_default") is None:
-                _try_step(
-                    cur,
-                    f'ALTER TABLE "{table_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;',
-                    step_name=f"drop_not_null_{table_name}_{col_name}",
-                )
-    except Exception as exc:
-        logger.warning("Could not relax extra columns on %s: %s", table_name, exc)
-
-
-def _heal_users_table(cur):
-    _try_step(
-        cur,
+def init_auth_db() -> sqlite3.Connection:
+  """Initialize SQLite auth store and seed a default demo user if empty."""
+  conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS users (
+          username TEXT PRIMARY KEY,
+          full_name TEXT NOT NULL,
+          email TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'Analyst',
+          salt_hex TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          reset_token TEXT,
+          reset_expires_at TEXT,
+          failed_attempts INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+      )
+      """)
+  cur = conn.execute("SELECT COUNT(*) FROM users")
+  count = cur.fetchone()[0]
+  if count == 0:
+    salt_h, pwd_h = hash_password("RogersBI#2026")
+    now_iso = datetime.utcnow().isoformat()
+    conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(100) UNIQUE NOT NULL,
-            full_name VARCHAR(150) NOT NULL DEFAULT 'User',
-            role VARCHAR(30) NOT NULL DEFAULT 'staff',
-            password_hash TEXT NOT NULL,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            reset_token TEXT,
-            reset_expires_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
+        INSERT INTO users (
+            username, full_name, email, role, salt_hex, password_hash,
+            reset_token, reset_expires_at, failed_attempts, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
         """,
-        step_name="create_users",
+        (
+            "admin",
+            "Rogers Lead Administrator",
+            "admin@rogersenterprises.local",
+            "Admin",
+            salt_h,
+            pwd_h,
+            now_iso,
+        ),
+    )
+    conn.commit()
+  return conn
+
+
+def get_user(conn: sqlite3.Connection, identifier: str) -> dict | None:
+  """Fetch user by username or email (case-insensitive)."""
+  clean_id = (identifier or "").strip().lower()
+  if not clean_id:
+    return None
+  row = conn.execute(
+      """
+      SELECT username, full_name, email, role, salt_hex, password_hash,
+             reset_token, reset_expires_at, failed_attempts, created_at
+      FROM users
+      WHERE LOWER(username) = ? OR LOWER(email) = ?
+      """,
+      (clean_id, clean_id),
+  ).fetchone()
+  if not row:
+    return None
+  return {
+      "username": row[0],
+      "full_name": row[1],
+      "email": row[2],
+      "role": row[3],
+      "salt_hex": row[4],
+      "password_hash": row[5],
+      "reset_token": row[6],
+      "reset_expires_at": row[7],
+      "failed_attempts": int(row[8] or 0),
+      "created_at": row[9],
+  }
+
+
+def register_user(
+    conn: sqlite3.Connection,
+    username: str,
+    full_name: str,
+    email: str,
+    role: str,
+    password: str,
+) -> tuple[bool, str]:
+  """Register a new user account."""
+  u = username.strip()
+  fn = full_name.strip()
+  em = email.strip()
+  if len(u) < 3 or not u.replace("_", "").replace(".", "").isalnum():
+    return False, "Username must be at least 3 characters (letters, numbers, _, .)."
+  if not fn:
+    return False, "Please enter your full name."
+  if "@" not in em or "." not in em.split("@")[-1]:
+    return False, "Please enter a valid email address."
+  strength_issues = validate_password_strength(password)
+  if strength_issues:
+    return False, "Password requirements not met: " + ", ".join(strength_issues) + "."
+  if get_user(conn, u) or get_user(conn, em):
+    return False, "An account with that username or email already exists."
+
+  salt_h, pwd_h = hash_password(password)
+  conn.execute(
+      """
+      INSERT INTO users (
+          username, full_name, email, role, salt_hex, password_hash,
+          reset_token, reset_expires_at, failed_attempts, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+      """,
+      (
+          u,
+          fn,
+          em,
+          role,
+          salt_h,
+          pwd_h,
+          datetime.utcnow().isoformat(),
+      ),
+  )
+  conn.commit()
+  return True, f"Account created for '{u}' ({role}). You can now log in."
+
+
+def authenticate_user(
+    conn: sqlite3.Connection, identifier: str, password: str
+) -> tuple[bool, str, dict | None]:
+  """Authenticate user credentials with attempt tracking."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "No account found matching that username or email.", None
+
+  if user["failed_attempts"] >= MAX_LOGIN_ATTEMPTS:
+    return (
+        False,
+        f"Account locked after {MAX_LOGIN_ATTEMPTS} failed attempts. Use 'Forgot / Reset Password' below to recover access.",
+        None,
     )
 
-    existing_cols = _get_table_columns(cur, "users")
+  if verify_password(password, user["salt_hex"], user["password_hash"]):
+    conn.execute(
+        "UPDATE users SET failed_attempts = 0 WHERE username = ?",
+        (user["username"],),
+    )
+    conn.commit()
+    return True, f"Welcome back, {user['full_name']}!", user
 
-    if "username" not in existing_cols:
-        _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);", step_name="add_username")
-        for candidate in ("email", "user_name", "login", "name"):
-            if candidate in existing_cols:
-                _try_step(
-                    cur,
-                    f"UPDATE users SET username = LOWER(TRIM({candidate}::text)) WHERE (username IS NULL OR TRIM(username) = '') AND {candidate} IS NOT NULL AND TRIM({candidate}::text) <> '';",
-                    step_name=f"backfill_username_from_{candidate}",
-                )
-        if "id" in existing_cols:
-            _try_step(
-                cur,
-                "UPDATE users SET username = 'user_' || id::text WHERE username IS NULL OR TRIM(username) = '';",
-                step_name="backfill_username_from_id",
-            )
+  new_attempts = user["failed_attempts"] + 1
+  conn.execute(
+      "UPDATE users SET failed_attempts = ? WHERE username = ?",
+      (new_attempts, user["username"]),
+  )
+  conn.commit()
+  remaining = max(0, MAX_LOGIN_ATTEMPTS - new_attempts)
+  return (
+      False,
+      f"Incorrect password. {remaining} attempt(s) remaining before temporary lock.",
+      None,
+  )
+
+
+def issue_recovery_token(
+    conn: sqlite3.Connection, identifier: str
+) -> tuple[bool, str, str | None]:
+  """Generate a 15-minute password reset token for an existing user."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "No account found for that username or email.", None
+  token = secrets.token_urlsafe(8)
+  expires_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+  conn.execute(
+      """
+      UPDATE users
+      SET reset_token = ?, reset_expires_at = ?
+      WHERE username = ?
+      """,
+      (token, expires_at, user["username"]),
+  )
+  conn.commit()
+  return (
+      True,
+      f"Recovery token generated for @{user['username']} (valid for 15 minutes).",
+      token,
+  )
+
+
+def reset_password_with_token(
+    conn: sqlite3.Connection,
+    identifier: str,
+    token: str,
+    new_password: str,
+) -> tuple[bool, str]:
+  """Validate recovery token and update user password."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "Account not found."
+  if not user["reset_token"] or not user["reset_expires_at"]:
+    return False, "No active recovery token found. Request a new token first."
+  if datetime.utcnow() > datetime.fromisoformat(user["reset_expires_at"]):
+    return False, "Recovery token has expired. Request a new token."
+  if not hmac.compare_digest(token.strip(), user["reset_token"].strip()):
+    return False, "Invalid recovery token."
+
+  issues = validate_password_strength(new_password)
+  if issues:
+    return False, "New password does not meet rules: " + ", ".join(issues) + "."
+
+  salt_h, pwd_h = hash_password(new_password)
+  conn.execute(
+      """
+      UPDATE users
+      SET salt_hex = ?, password_hash = ?, reset_token = NULL,
+          reset_expires_at = NULL, failed_attempts = 0
+      WHERE username = ?
+      """,
+      (salt_h, pwd_h, user["username"]),
+  )
+  conn.commit()
+  return True, "Password reset successful. You may now log in with your new password."
+
+
+def render_auth_gate(conn: sqlite3.Connection) -> bool:
+  """Render Sign In, Sign Up, and Password Recovery UI with explicit prompts."""
+  if st.session_state.get("auth_user"):
+    return True
+
+  st.title("🔐 Enterprise Access & Account Portal")
+  st.caption(
+      "Rogers Enterprises Limited | Secure Sign-In, Account Registration & Password Recovery"
+  )
+
+  st.info(
+      "**What to do here:**\n"
+      "- **Existing Users (Login):** Enter your *Username or Email* and *Password*. "
+      "Demo admin credentials: `admin` / `RogersBI#2026`.\n"
+      "- **New Users (Sign Up):** Switch to **Create Account**, choose your workspace role "
+      "(*Analyst* for analytics & reporting, *Admin* for full operational controls), and set a strong password.\n"
+      "- **Forgot Password (Recovery):** Switch to **Recover Password** to generate a 15-minute reset token and set a new password."
+  )
+
+  tab_login, tab_signup, tab_reset = st.tabs(
+      ["🔑 Login", "📝 Create Account (Sign Up)", "♻️ Recover / Reset Password"]
+  )
+
+  with tab_login:
+    st.subheader("Sign In to Your Workspace")
+    st.markdown(
+        "**Required right now:** Provide your registered **Username or Email** and **Password**, then click **Sign In**."
+    )
+    with st.form("login_form"):
+      login_id = st.text_input(
+          "Username or Email",
+          placeholder="e.g., admin or analyst@company.com",
+      )
+      login_pwd = st.text_input(
+          "Password",
+          type="password",
+          placeholder="Enter your password",
+      )
+      submitted_login = st.form_submit_button("🔓 Sign In", use_container_width=True)
+
+    if submitted_login:
+      if not login_id.strip() or not login_pwd:
+        st.warning("Please enter both your Username/Email and Password before signing in.")
+      else:
+        ok, msg, user_rec = authenticate_user(conn, login_id, login_pwd)
+        if ok and user_rec:
+          st.session_state["auth_user"] = user_rec
+          st.success(msg)
+          st.rerun()
         else:
-            _try_step(
-                cur,
-                "UPDATE users SET username = 'staff_user' WHERE username IS NULL OR TRIM(username) = '';",
-                step_name="backfill_username_default",
-            )
+          st.error(msg)
 
-    if "id" in existing_cols:
-        _try_step(
-            cur,
-            """
-            WITH ranked AS (
-                SELECT
-                    id,
-                    username,
-                    ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(username)) ORDER BY id ASC) AS rn
-                FROM users
-                WHERE username IS NOT NULL AND TRIM(username) <> ''
-            )
-            UPDATE users u
-            SET username = LEFT(u.username, 80) || '_' || u.id::text
-            FROM ranked r
-            WHERE u.id = r.id AND r.rn > 1;
-            """,
-            step_name="deduplicate_usernames",
-        )
-
-    _try_step(
-        cur,
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint c
-                JOIN pg_class t ON t.oid = c.conrelid
-                WHERE t.relname = 'users' AND c.contype = 'u'
-            ) AND NOT EXISTS (
-                SELECT 1
-                FROM pg_indexes
-                WHERE tablename = 'users' AND indexdef ILIKE '%UNIQUE%username%'
-            ) THEN
-                ALTER TABLE users ADD CONSTRAINT users_username_unique UNIQUE (username);
-            END IF;
-        EXCEPTION
-            WHEN unique_violation OR duplicate_table OR duplicate_object THEN
-                NULL;
-        END$$;
-        """,
-        step_name="add_username_unique_safe",
+  with tab_signup:
+    st.subheader("Register a New Enterprise Account")
+    st.markdown(
+        "**Required right now:** Fill in all fields below. Your password must have **8+ characters**, "
+        "**1 uppercase letter**, **1 lowercase letter**, and **1 digit**."
     )
+    with st.form("signup_form"):
+      s_col1, s_col2 = st.columns(2)
+      new_fullname = s_col1.text_input(
+          "Full Name", placeholder="e.g., Kwame Mensah"
+      )
+      new_username = s_col2.text_input(
+          "Choose Username", placeholder="e.g., kwame_bi"
+      )
+      s_col3, s_col4 = st.columns(2)
+      new_email = s_col3.text_input(
+          "Work Email", placeholder="e.g., kwame@rogersenterprises.com"
+      )
+      new_role = s_col4.selectbox(
+          "Select Access Role",
+          ["Analyst", "Inventory Planner", "Admin"],
+          help="Analyst & Inventory Planner can run BI & forecasting; Admin manages full operational workflows.",
+      )
+      p_col1, p_col2 = st.columns(2)
+      new_pwd = p_col1.text_input(
+          "Create Password", type="password", placeholder="Min 8 chars, Aa1"
+      )
+      confirm_pwd = p_col2.text_input(
+          "Confirm Password", type="password", placeholder="Re-enter password"
+      )
+      submitted_signup = st.form_submit_button(
+          "✅ Create Account", use_container_width=True
+      )
 
-    _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;", step_name="add_password_hash")
-    for pw_candidate in ("password", "password_digest", "pass_hash", "passwd"):
-        if pw_candidate in existing_cols:
-            _try_step(
-                cur,
-                f"UPDATE users SET password_hash = {pw_candidate}::text WHERE (password_hash IS NULL OR TRIM(password_hash) = '') AND {pw_candidate} IS NOT NULL AND TRIM({pw_candidate}::text) <> '';",
-                step_name=f"backfill_password_hash_from_{pw_candidate}",
-            )
-
-    for ddl, label in [
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';", "add_full_name"),
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'staff';", "add_role"),
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;", "add_is_active"),
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;", "add_reset_token"),
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TIMESTAMPTZ;", "add_reset_expires_at"),
-        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "add_created_at"),
-    ]:
-        _try_step(cur, ddl, step_name=label)
-
-    _relax_extra_not_null_columns(
-        cur,
-        "users",
-        {"id", "username", "full_name", "role", "password_hash", "is_active", "reset_token", "reset_expires_at", "created_at"},
-    )
-
-    _try_step(
-        cur,
-        """
-        UPDATE users
-        SET full_name = username
-        WHERE (full_name IS NULL OR TRIM(full_name) = '' OR full_name = 'User')
-          AND username IS NOT NULL AND TRIM(username) <> '';
-        """,
-        step_name="sync_full_name",
-    )
-    _try_step(cur, "UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';", step_name="sync_role")
-    _try_step(cur, "UPDATE users SET is_active = TRUE WHERE is_active IS NULL;", step_name="sync_is_active")
-
-    _try_step(
-        cur,
-        """
-        INSERT INTO users (username, full_name, role, password_hash, is_active)
-        SELECT 'admin', 'System Administrator', 'admin', %s, TRUE
-        WHERE NOT EXISTS (
-            SELECT 1 FROM users WHERE LOWER(TRIM(username)) = 'admin'
-        );
-        """,
-        (hash_password(DEFAULT_ADMIN_PASSWORD),),
-        step_name="ensure_admin_account",
-    )
-
-
-def _heal_products_table(cur):
-    _try_step(
-        cur,
-        """
-        CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
-            sku VARCHAR(60) UNIQUE NOT NULL,
-            name VARCHAR(200) NOT NULL,
-            category VARCHAR(100) NOT NULL DEFAULT 'General',
-            unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-            selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-            stock_qty INTEGER NOT NULL DEFAULT 0,
-            reorder_level INTEGER NOT NULL DEFAULT 10,
-            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        step_name="create_products",
-    )
-    cols = _get_table_columns(cur, "products")
-    for ddl, label in [
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(60);", "prod_add_sku"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS name VARCHAR(200) NOT NULL DEFAULT 'Unnamed Item';", "prod_add_name"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(100) NOT NULL DEFAULT 'General';", "prod_add_cat"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_cost"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_price"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;", "prod_add_qty"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS reorder_level INTEGER NOT NULL DEFAULT 10;", "prod_add_reorder"),
-        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "prod_add_updated"),
-    ]:
-        _try_step(cur, ddl, step_name=label)
-
-    if "sku" in cols or "id" in cols:
-        _try_step(
-            cur,
-            "UPDATE products SET sku = 'SKU-' || id::text WHERE (sku IS NULL OR TRIM(sku) = '') AND id IS NOT NULL;",
-            step_name="prod_backfill_sku",
+    if submitted_signup:
+      if new_pwd != confirm_pwd:
+        st.error("Passwords do not match. Please re-enter both password fields.")
+      else:
+        ok, msg = register_user(
+            conn, new_username, new_fullname, new_email, new_role, new_pwd
         )
-    for alt_name in ("product_name", "title", "item_name"):
-        if alt_name in cols:
-            _try_step(
-                cur,
-                f"UPDATE products SET name = {alt_name}::text WHERE (name IS NULL OR TRIM(name) = '' OR name = 'Unnamed Item') AND {alt_name} IS NOT NULL;",
-                step_name=f"prod_backfill_name_{alt_name}",
-            )
-    for alt_qty in ("quantity", "qty", "stock"):
-        if alt_qty in cols:
-            _try_step(
-                cur,
-                f"UPDATE products SET stock_qty = COALESCE({alt_qty}::integer, 0) WHERE stock_qty = 0 AND {alt_qty} IS NOT NULL;",
-                step_name=f"prod_backfill_qty_{alt_qty}",
-            )
-    _relax_extra_not_null_columns(
-        cur,
-        "products",
-        {"id", "sku", "name", "category", "unit_cost", "selling_price", "stock_qty", "reorder_level", "updated_at"},
-    )
-
-
-def _heal_transactions_table(cur):
-    _try_step(
-        cur,
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY,
-            tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE',
-            product_id INTEGER,
-            sku VARCHAR(60) NOT NULL DEFAULT '',
-            product_name VARCHAR(200) NOT NULL DEFAULT '',
-            quantity INTEGER NOT NULL DEFAULT 0,
-            unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-            total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-            recorded_by VARCHAR(100) NOT NULL DEFAULT 'system',
-            notes TEXT,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        step_name="create_transactions",
-    )
-    cols = _get_table_columns(cur, "transactions")
-    for ddl, label in [
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE';", "tx_add_tx_type"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_id INTEGER;", "tx_add_product_id"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sku VARCHAR(60) NOT NULL DEFAULT '';", "tx_add_sku"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_name VARCHAR(200) NOT NULL DEFAULT '';", "tx_add_prod_name"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;", "tx_add_qty"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_unit_price"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_total"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recorded_by VARCHAR(100) NOT NULL DEFAULT 'system';", "tx_add_recorded_by"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS notes TEXT;", "tx_add_notes"),
-        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "tx_add_created_at"),
-    ]:
-        _try_step(cur, ddl, step_name=label)
-
-    for alt_type in ("type", "transaction_type", "movement_type"):
-        if alt_type in cols:
-            _try_step(
-                cur,
-                f"UPDATE transactions SET tx_type = UPPER(TRIM({alt_type}::text)) WHERE (tx_type IS NULL OR TRIM(tx_type) = '') AND {alt_type} IS NOT NULL;",
-                step_name=f"tx_backfill_type_{alt_type}",
-            )
-    for alt_qty in ("qty", "stock_qty"):
-        if alt_qty in cols:
-            _try_step(
-                cur,
-                f"UPDATE transactions SET quantity = COALESCE({alt_qty}::integer, 0) WHERE quantity = 0 AND {alt_qty} IS NOT NULL;",
-                step_name=f"tx_backfill_qty_{alt_qty}",
-            )
-    for alt_amt in ("amount", "total", "price"):
-        if alt_amt in cols:
-            _try_step(
-                cur,
-                f"UPDATE transactions SET total_amount = COALESCE({alt_amt}::numeric, 0.00) WHERE total_amount = 0 AND {alt_amt} IS NOT NULL;",
-                step_name=f"tx_backfill_amt_{alt_amt}",
-            )
-    for alt_actor in ("user", "username", "created_by", "actor"):
-        if alt_actor in cols:
-            _try_step(
-                cur,
-                f"UPDATE transactions SET recorded_by = {alt_actor}::text WHERE (recorded_by IS NULL OR TRIM(recorded_by) = '' OR recorded_by = 'system') AND {alt_actor} IS NOT NULL;",
-                step_name=f"tx_backfill_actor_{alt_actor}",
-            )
-    _relax_extra_not_null_columns(
-        cur,
-        "transactions",
-        {"id", "tx_type", "product_id", "sku", "product_name", "quantity", "unit_price", "total_amount", "recorded_by", "notes", "created_at"},
-    )
-
-
-def _heal_audit_logs_table(cur):
-    _try_step(
-        cur,
-        """
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(100) NOT NULL DEFAULT 'system',
-            action VARCHAR(120) NOT NULL DEFAULT 'EVENT',
-            details TEXT,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        step_name="create_audit_logs",
-    )
-    for ddl, label in [
-        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS username VARCHAR(100) NOT NULL DEFAULT 'system';", "audit_add_user"),
-        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS action VARCHAR(120) NOT NULL DEFAULT 'EVENT';", "audit_add_action"),
-        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS details TEXT;", "audit_add_details"),
-        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "audit_add_created"),
-    ]:
-        _try_step(cur, ddl, step_name=label)
-    _relax_extra_not_null_columns(cur, "audit_logs", {"id", "username", "action", "details", "created_at"})
-
-
-def _apply_schema_and_seed(cur):
-    _heal_users_table(cur)
-    _heal_products_table(cur)
-    _heal_transactions_table(cur)
-    _heal_audit_logs_table(cur)
-
-    cur.execute("SELECT COUNT(*) AS cnt FROM products;")
-    prow = cur.fetchone()
-    prod_count = safe_int(prow["cnt"] if prow else 0)
-    if prod_count == 0:
-        starter_products = [
-            ("SKU-1001", "Wireless Barcode Scanner", "Hardware", 180.00, 260.00, 24, 8),
-            ("SKU-1002", "Thermal Receipt Paper (Roll)", "Supplies", 6.50, 12.00, 120, 30),
-            ("SKU-1003", "POS Cash Drawer", "Hardware", 240.00, 340.00, 6, 5),
-            ("SKU-1004", "Inventory Label Stickers", "Supplies", 9.00, 16.50, 14, 15),
-        ]
-        _try_step(cur, "SAVEPOINT sp_seed_prods;", step_name="sp_seed_prods_init")
-        try:
-            extras.execute_batch(
-                cur,
-                """
-                INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (sku) DO NOTHING;
-                """,
-                starter_products,
-            )
-            cur.execute("RELEASE SAVEPOINT sp_seed_prods;")
-        except Exception as exc:
-            cur.execute("ROLLBACK TO SAVEPOINT sp_seed_prods;")
-            logger.warning("Seed products skipped: %s", exc)
-
-
-@st.cache_resource(show_spinner="Connecting to database and verifying schema...")
-def init_database_schema() -> bool:
-    """Initialize schema once per process; clear cache automatically on failure."""
-    try:
-        run_write_tx(_apply_schema_and_seed)
-        return True
-    except Exception:
-        init_database_schema.clear()
-        raise
-
-
-def log_audit(username: str, action: str, details: str = ""):
-    """Best-effort audit logging that never crashes the main user workflow."""
-    try:
-        clean_actor = (username or "system").strip().lower()[:100]
-        clean_action = str(action)[:120]
-        clean_details = str(details)[:1000]
-        now_ts = utc_now()
-
-        def _op(cur):
-            _heal_audit_logs_table(cur)
-            cur.execute(
-                """
-                INSERT INTO audit_logs (username, action, details, created_at)
-                VALUES (%s, %s, %s, %s);
-                """,
-                (clean_actor, clean_action, clean_details, now_ts),
-            )
-
-        run_write_tx(_op)
-    except Exception as exc:
-        logger.warning("Audit log write skipped: %s", exc)# ==============================================================================
-# 4. USER ACCOUNT, CHANGE PASSWORD & RECOVERY OPERATIONS
-# ==============================================================================
-def register_staff_user(username: str, full_name: str, password: str) -> tuple[bool, str]:
-    """Create a standard 'staff' account. Admin promotion is restricted to admins."""
-    clean_user = (username or "").strip().lower()
-    clean_name = (full_name or "").strip()
-    if len(clean_user) < 3:
-        return False, "Username must be at least 3 characters."
-    if len(clean_name) < 2:
-        return False, "Full name is required."
-    if len(password or "") < 6:
-        return False, "Password must be at least 6 characters."
-
-    pwd_hash = hash_password(password)
-    now_ts = utc_now()
-
-    def _op(cur):
-        _heal_users_table(cur)
-        cur.execute(
-            """
-            INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
-            VALUES (%s, %s, 'staff', %s, TRUE, %s)
-            ON CONFLICT (username) DO NOTHING
-            RETURNING id;
-            """,
-            (clean_user, clean_name, pwd_hash, now_ts),
-        )
-        return cur.fetchone()
-
-    try:
-        row = run_write_tx(_op)
-        if row is None:
-            return False, f"Username '{clean_user}' already exists."
-        log_audit(clean_user, "STAFF_SIGNUP", "Self-registered with role 'staff'")
-        return True, f"Staff account created for @{clean_user}. You can sign in now."
-    except Exception as exc:
-        logger.exception("Error registering user %s", clean_user)
-        return False, f"Error creating account: {exc}"
-
-
-def _sync_default_admin(password: str) -> dict:
-    """Ensure the default admin row exists, is active, and has a valid PBKDF2 hash."""
-    fresh_hash = hash_password(password)
-    now_ts = utc_now()
-
-    def _op(cur):
-        _heal_users_table(cur)
-        cur.execute(
-            """
-            UPDATE users
-            SET role = 'admin',
-                is_active = TRUE,
-                password_hash = %s,
-                reset_token = NULL,
-                reset_expires_at = NULL
-            WHERE LOWER(TRIM(username)) = %s
-            RETURNING id, username, full_name, role;
-            """,
-            (fresh_hash, DEFAULT_ADMIN_USERNAME),
-        )
-        row = cur.fetchone()
-        if row:
-            return dict(row)
-        cur.execute(
-            """
-            INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
-            VALUES (%s, 'System Administrator', 'admin', %s, TRUE, %s)
-            RETURNING id, username, full_name, role;
-            """,
-            (DEFAULT_ADMIN_USERNAME, fresh_hash, now_ts),
-        )
-        inserted = cur.fetchone()
-        return dict(inserted) if inserted else {
-            "id": 1,
-            "username": DEFAULT_ADMIN_USERNAME,
-            "full_name": "System Administrator",
-            "role": "admin",
-        }
-
-    saved = run_write_tx(_op)
-    return {
-        "id": safe_int(saved.get("id"), 1),
-        "username": str(saved.get("username") or DEFAULT_ADMIN_USERNAME),
-        "full_name": str(saved.get("full_name") or "System Administrator"),
-        "role": "admin",
-    }
-
-
-def authenticate_user(username: str, password: str) -> dict | None:
-    clean_user = (username or "").strip().lower()
-    raw_password = password or ""
-    if not clean_user or not raw_password:
-        return None
-
-    try:
-        df = run_read_query(
-            """
-            SELECT id, username, full_name, role, password_hash, is_active
-            FROM users
-            WHERE LOWER(TRIM(username)) = %s
-            LIMIT 1;
-            """,
-            (clean_user,),
-        )
-
-        if clean_user == DEFAULT_ADMIN_USERNAME and raw_password == DEFAULT_ADMIN_PASSWORD:
-            if df.empty or not verify_password(raw_password, df.iloc[0].to_dict().get("password_hash")):
-                return _sync_default_admin(raw_password)
-
-        if df.empty:
-            return None
-
-        rec = df.iloc[0].to_dict()
-        if not bool(rec.get("is_active", False)):
-            return None
-
-        stored = rec.get("password_hash")
-        if verify_password(raw_password, stored):
-            return {
-                "id": safe_int(rec.get("id")),
-                "username": str(rec.get("username") or clean_user),
-                "full_name": str(rec.get("full_name") or rec.get("username") or clean_user),
-                "role": str(rec.get("role") or "staff"),
-            }
-        return None
-    except Exception as exc:
-        logger.exception("Authentication failed for %s", clean_user)
-        st.error(f"Authentication error: {exc}")
-        return None
-
-
-def change_user_password(username: str, current_password: str, new_password: str) -> tuple[bool, str]:
-    clean_user = (username or "").strip().lower()
-    if len(new_password or "") < 6:
-        return False, "New password must be at least 6 characters."
-    if current_password == new_password:
-        return False, "New password must be different from your current password."
-
-    try:
-        df = run_read_query(
-            "SELECT id, password_hash, is_active FROM users WHERE LOWER(TRIM(username)) = %s LIMIT 1;",
-            (clean_user,),
-        )
-        if df.empty:
-            return False, "Account not found."
-        rec = df.iloc[0].to_dict()
-        if not bool(rec.get("is_active", False)):
-            return False, "Account is inactive."
-        if not verify_password(current_password, rec.get("password_hash")):
-            log_audit(clean_user, "PASSWORD_CHANGE_FAILED", "Incorrect current password")
-            return False, "Current password is incorrect."
-
-        user_id = safe_int(rec.get("id"))
-        new_hash = hash_password(new_password)
-
-        def _op(cur):
-            cur.execute(
-                """
-                UPDATE users
-                SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
-                WHERE id = %s;
-                """,
-                (new_hash, user_id),
-            )
-
-        run_write_tx(_op)
-        log_audit(clean_user, "PASSWORD_CHANGED", "Updated password via account settings")
-        return True, "Password changed successfully."
-    except Exception as exc:
-        logger.exception("Password change failed for %s", clean_user)
-        return False, f"Failed to change password: {exc}"
-
-
-def issue_password_reset_token(
-    username: str, ttl_minutes: int = RECOVERY_TOKEN_TTL_MINUTES
-) -> tuple[bool, str | None]:
-    clean_user = (username or "").strip().lower()
-    if not clean_user:
-        return False, None
-
-    ttl = max(1, safe_int(ttl_minutes, RECOVERY_TOKEN_TTL_MINUTES))
-    token = secrets.token_urlsafe(24)
-    expires_at = utc_now() + timedelta(minutes=ttl)
-
-    def _op(cur):
-        cur.execute(
-            """
-            UPDATE users
-            SET reset_token = %s, reset_expires_at = %s
-            WHERE LOWER(TRIM(username)) = %s AND is_active = TRUE
-            RETURNING username;
-            """,
-            (token, expires_at, clean_user),
-        )
-        return cur.fetchone()
-
-    try:
-        updated = run_write_tx(_op)
-        if not updated:
-            log_audit(clean_user, "PASSWORD_RESET_REQUEST", "Requested for non-existent or inactive user")
-            return False, None
-        log_audit(clean_user, "PASSWORD_RESET_TOKEN_ISSUED", f"Expires in {ttl} minutes")
-        return True, token
-    except Exception as exc:
-        logger.exception("Failed to issue reset token for %s", clean_user)
-        return False, None
-
-
-def reset_password_with_token(token: str, new_password: str) -> tuple[bool, str]:
-    clean_token = (token or "").strip()
-    if not clean_token:
-        return False, "Recovery token is required."
-    if len(new_password or "") < 6:
-        return False, "New password must be at least 6 characters."
-
-    now_ts = utc_now()
-
-    def _op(cur):
-        cur.execute(
-            """
-            SELECT id, username, reset_expires_at, is_active
-            FROM users
-            WHERE reset_token = %s
-            LIMIT 1;
-            """,
-            (clean_token,),
-        )
-        user = cur.fetchone()
-        if not user or not bool(user.get("is_active", False)):
-            return False, "Invalid recovery token."
-
-        expires_at = user.get("reset_expires_at")
-        if expires_at is None:
-            return False, "Invalid or already used recovery token."
-        if isinstance(expires_at, str):
-            expires_at = datetime.fromisoformat(expires_at)
-        if getattr(expires_at, "tzinfo", None) is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at < now_ts:
-            return False, "Recovery token has expired. Request a new one."
-
-        cur.execute(
-            """
-            UPDATE users
-            SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
-            WHERE id = %s;
-            """,
-            (hash_password(new_password), user["id"]),
-        )
-        return True, f"Password reset successful for @{user['username']}. You can now sign in."
-
-    try:
-        ok, msg = run_write_tx(_op)
         if ok:
-            log_audit("recovery", "PASSWORD_RESET_COMPLETED", "Password reset via recovery token")
-        return ok, msg
-    except Exception as exc:
-        logger.exception("Password reset with token failed")
-        return False, f"Password reset failed: {exc}"
-
-
-def admin_reset_user_password(
-    target_user_id: int, new_password: str, actor_role: str, actor: str
-) -> tuple[bool, str]:
-    if actor_role != "admin":
-        return False, "Only administrators can reset user passwords."
-    if len(new_password or "") < 6:
-        return False, "New password must be at least 6 characters."
-
-    new_hash = hash_password(new_password)
-
-    def _op(cur):
-        cur.execute(
-            """
-            UPDATE users
-            SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
-            WHERE id = %s
-            RETURNING username;
-            """,
-            (new_hash, int(target_user_id)),
-        )
-        return cur.fetchone()
-
-    try:
-        updated = run_write_tx(_op)
-        if not updated:
-            return False, "User not found."
-        target_name = updated.get("username", "unknown")
-        log_audit(actor, "ADMIN_PASSWORD_RESET", f"Reset password for @{target_name}")
-        return True, f"Password reset for @{target_name}."
-    except Exception as exc:
-        logger.exception("Admin password reset failed for user %s", target_user_id)
-        return False, f"Failed to reset password: {exc}"
-
-
-def fetch_all_users() -> pd.DataFrame:
-    try:
-        return run_read_query(
-            "SELECT id, username, full_name, role, is_active, created_at FROM users ORDER BY id;"
-        )
-    except Exception as exc:
-        st.error(f"Failed to load users: {exc}")
-        return pd.DataFrame()
-
-
-def update_user_role_or_status(
-    user_id: int, role: str, is_active: bool, actor_role: str, actor: str
-) -> tuple[bool, str]:
-    if actor_role != "admin":
-        return False, "Only administrators can change user roles or status."
-    if role not in ("staff", "admin"):
-        return False, "Invalid role selection."
-
-    def _op(cur):
-        cur.execute(
-            """
-            UPDATE users
-            SET role = %s, is_active = %s
-            WHERE id = %s
-            RETURNING username;
-            """,
-            (role, bool(is_active), int(user_id)),
-        )
-        return cur.fetchone()
-
-    try:
-        updated = run_write_tx(_op)
-        if not updated:
-            return False, "User not found."
-        target_name = updated.get("username", "unknown")
-        log_audit(actor, "USER_ROLE_UPDATED", f"Target @{target_name} -> role={role}, active={is_active}")
-        return True, f"Updated @{target_name} (Role: {role}, Active: {is_active})."
-    except Exception as exc:
-        logger.exception("Failed to update user %s", user_id)
-        return False, f"Failed to update user: {exc}"
-
-# ==============================================================================
-# 5. INVENTORY & TRANSACTION OPERATIONS
-# ==============================================================================
-def fetch_products() -> pd.DataFrame:
-    try:
-        run_write_tx(_heal_products_table)
-        df = run_read_query(
-            """
-            SELECT
-                id,
-                sku,
-                name,
-                category,
-                unit_cost,
-                selling_price,
-                stock_qty,
-                reorder_level,
-                updated_at
-            FROM products
-            ORDER BY id DESC;
-            """
-        )
-        if df.empty:
-            return pd.DataFrame(
-                columns=[
-                    "id", "sku", "name", "category", "unit_cost", "selling_price",
-                    "stock_qty", "reorder_level", "updated_at", "stock_value",
-                    "retail_value", "status",
-                ]
-            )
-
-        df["unit_cost"] = df["unit_cost"].apply(safe_float)
-        df["selling_price"] = df["selling_price"].apply(safe_float)
-        df["stock_qty"] = df["stock_qty"].apply(safe_int)
-        df["reorder_level"] = df["reorder_level"].apply(safe_int)
-        df["stock_value"] = df["stock_qty"] * df["unit_cost"]
-        df["retail_value"] = df["stock_qty"] * df["selling_price"]
-        df["status"] = df.apply(
-            lambda r: "Out of Stock"
-            if r["stock_qty"] <= 0
-            else ("Low Stock" if r["stock_qty"] <= r["reorder_level"] else "Healthy"),
-            axis=1,
-        )
-        return df
-    except Exception as exc:
-        st.error(f"Failed to load products: {exc}")
-        return pd.DataFrame()
-
-
-def add_or_update_product(
-    sku: str,
-    name: str,
-    category: str,
-    unit_cost: float,
-    selling_price: float,
-    stock_qty: int,
-    reorder_level: int,
-    actor: str,
-) -> tuple[bool, str]:
-    clean_sku = (sku or "").strip().upper()
-    clean_name = (name or "").strip()
-    clean_cat = (category or "").strip() or "General"
-    if not clean_sku or not clean_name:
-        return False, "SKU and Product Name are required."
-
-    c_cost = max(0.0, safe_float(unit_cost))
-    s_price = max(0.0, safe_float(selling_price))
-    s_qty = max(0, safe_int(stock_qty))
-    r_lvl = max(0, safe_int(reorder_level))
-    now_ts = utc_now()
-
-    def _op(cur):
-        _heal_products_table(cur)
-        _heal_transactions_table(cur)
-        cur.execute(
-            """
-            INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (sku) DO UPDATE SET
-                name = EXCLUDED.name,
-                category = EXCLUDED.category,
-                unit_cost = EXCLUDED.unit_cost,
-                selling_price = EXCLUDED.selling_price,
-                stock_qty = EXCLUDED.stock_qty,
-                reorder_level = EXCLUDED.reorder_level,
-                updated_at = EXCLUDED.updated_at
-            RETURNING id;
-            """,
-            (clean_sku, clean_name, clean_cat, c_cost, s_price, s_qty, r_lvl, now_ts),
-        )
-        saved_row = cur.fetchone()
-        prod_id = saved_row["id"] if saved_row else None
-
-        if s_qty > 0:
-            cur.execute(
-                """
-                INSERT INTO transactions (tx_type, product_id, sku, product_name, quantity, unit_price, total_amount, recorded_by, notes, created_at)
-                VALUES ('STOCK_IN', %s, %s, %s, %s, %s, %s, %s, 'Initial / catalog upsert', %s);
-                """,
-                (prod_id, clean_sku, clean_name, s_qty, c_cost, round(s_qty * c_cost, 2), actor, now_ts),
-            )
-
-    try:
-        run_write_tx(_op)
-        log_audit(actor, "PRODUCT_UPSERT", f"{clean_sku} ({clean_name}) qty={s_qty}")
-        return True, f"Saved product {clean_sku} — {clean_name}."
-    except Exception as exc:
-        logger.exception("Failed to save product %s", clean_sku)
-        return False, f"Failed to save product: {exc}"
-
-
-def record_stock_movement(
-    product_id: int | None,
-    tx_type: str,
-    quantity: int,
-    custom_price: float | None,
-    notes: str,
-    actor: str,
-    sku_fallback: str = "",
-) -> tuple[bool, str]:
-    qty = safe_int(quantity)
-    if qty <= 0:
-        return False, "Quantity must be greater than zero."
-
-    now_ts = utc_now()
-    clean_notes = (notes or "").strip()
-    clean_sku = (sku_fallback or "").strip().upper()
-
-    def _op(cur):
-        _heal_products_table(cur)
-        _heal_transactions_table(cur)
-        if product_id is not None:
-            cur.execute("SELECT * FROM products WHERE id = %s FOR UPDATE;", (int(product_id),))
+          st.success(msg)
         else:
-            cur.execute("SELECT * FROM products WHERE UPPER(TRIM(sku)) = %s FOR UPDATE;", (clean_sku,))
-        prod = cur.fetchone()
-        if not prod:
-            return False, f"Product '{clean_sku or product_id}' was not found in stock."
+          st.error(msg)
 
-        pid = safe_int(prod.get("id"))
-        current_qty = safe_int(prod.get("stock_qty"))
-        if tx_type == "SALE":
-            if current_qty < qty:
-                return False, f"Insufficient stock for {prod.get('sku', '')}. Available: {current_qty}, requested: {qty}."
-            new_qty = current_qty - qty
-            unit_price = safe_float(custom_price) if custom_price is not None else safe_float(prod.get("selling_price"))
-        elif tx_type == "RESTOCK":
-            new_qty = current_qty + qty
-            unit_price = safe_float(custom_price) if custom_price is not None else safe_float(prod.get("unit_cost"))
-        else:
-            return False, "Unsupported movement type."
+  with tab_reset:
+    st.subheader("Password Recovery & Reset")
+    st.markdown(
+        "**Step 1:** Enter your **Username or Email** and click **Generate Recovery Token**.\n"
+        "**Step 2:** Copy the token shown and enter your **New Password** below, then click **Reset Password**."
+    )
+    with st.form("request_token_form"):
+      rec_id = st.text_input(
+          "Account Username or Email",
+          placeholder="Enter username or email to recover",
+      )
+      req_token_btn = st.form_submit_button("🎟️ Generate Recovery Token")
 
-        total_amount = round(qty * unit_price, 2)
+    if req_token_btn:
+      ok, msg, token_val = issue_recovery_token(conn, rec_id)
+      if ok and token_val:
+        st.session_state["last_issued_token"] = token_val
+        st.session_state["last_recovery_id"] = rec_id.strip()
+        st.success(msg)
+        st.code(token_val, language="text")
+      else:
+        st.error(msg)
 
-        cur.execute(
-            """
-            UPDATE products
-            SET stock_qty = %s, updated_at = %s
-            WHERE id = %s;
-            """,
-            (new_qty, now_ts, pid),
+    st.markdown("---")
+    with st.form("apply_reset_form"):
+      r_col1, r_col2 = st.columns(2)
+      reset_id = r_col1.text_input(
+          "Confirm Username or Email",
+          value=st.session_state.get("last_recovery_id", ""),
+      )
+      reset_token = r_col2.text_input(
+          "Recovery Token",
+          value=st.session_state.get("last_issued_token", ""),
+          placeholder="Paste 15-minute recovery token",
+      )
+      r_col3, r_col4 = st.columns(2)
+      reset_new_pwd = r_col3.text_input("New Password", type="password")
+      reset_confirm_pwd = r_col4.text_input("Confirm New Password", type="password")
+      apply_reset_btn = st.form_submit_button(
+          "🔁 Reset Password", use_container_width=True
+      )
+
+    if apply_reset_btn:
+      if reset_new_pwd != reset_confirm_pwd:
+        st.error("New password and confirmation do not match.")
+      else:
+        ok, msg = reset_password_with_token(
+            conn, reset_id, reset_token, reset_new_pwd
         )
+        if ok:
+          st.session_state.pop("last_issued_token", None)
+          st.success(msg)
+        else:
+          st.error(msg)
 
-        cur.execute(
-            """
-            INSERT INTO transactions (tx_type, product_id, sku, product_name, quantity, unit_price, total_amount, recorded_by, notes, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """,
-            (
-                tx_type,
-                pid,
-                prod.get("sku", ""),
-                prod.get("name", ""),
-                qty,
-                unit_price,
-                total_amount,
-                actor,
-                clean_notes,
-                now_ts,
+  return False
+
+
+# ---------------------------------------------------------
+# SHARED SAFE DATA & ANALYTICS HELPERS
+# ---------------------------------------------------------
+def clean_text_cell(v):
+  """Normalize text cells and map null-like strings to np.nan."""
+  if v is None:
+    return np.nan
+  try:
+    if pd.isna(v):
+      return np.nan
+  except Exception:
+    pass
+  cleaned = " ".join(str(v).strip().split())
+  return (
+      np.nan
+      if cleaned in {"", "nan", "NaN", "None", "none", "NULL", "null", "<NA>"}
+      else cleaned
+  )
+
+
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+  """Safely convert currency/comma strings and numbers into float64."""
+  if s is None or len(s) == 0:
+    return pd.Series([], dtype="float64")
+  if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+    return pd.to_numeric(s, errors="coerce")
+  cleaned_str = (
+      s.apply(clean_text_cell)
+      .dropna()
+      .astype(str)
+      .str.replace(r"[,\sGHS$€£¥₦]", "", regex=True)
+      .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+      .str.strip()
+  )
+  out = pd.Series(np.nan, index=s.index, dtype="float64")
+  parsed = pd.to_numeric(cleaned_str, errors="coerce")
+  out.loc[parsed.index] = parsed
+  return out
+
+
+def find_col_case_insensitive(df: pd.DataFrame, target: str) -> str | None:
+  """Find a DataFrame column matching target ignoring case and outer spaces."""
+  target_low = target.strip().lower()
+  for col in df.columns:
+    if str(col).strip().lower() == target_low:
+      return col
+  return None
+
+
+def load_any_tabular_file(uploaded_file, key_prefix: str = "lab") -> pd.DataFrame:
+  """Load CSV or Excel workbook safely with encoding fallback."""
+  name = str(uploaded_file.name).lower()
+  if name.endswith(".csv"):
+    for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
+      try:
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, encoding=enc)
+      except Exception:
+        continue
+    uploaded_file.seek(0)
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
+  uploaded_file.seek(0)
+  xls = pd.ExcelFile(uploaded_file)
+  sheet_name = st.selectbox(
+      "Select Excel Sheet", xls.sheet_names, key=f"{key_prefix}_excel_sheet"
+  )
+  uploaded_file.seek(0)
+  return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+
+
+def compute_exponential_forecast(
+    series: pd.Series, steps: int = 7, alpha: float = 0.45, beta: float = 0.25
+) -> np.ndarray:
+  """Holt's linear trend exponential smoothing for modern short-horizon forecasting."""
+  vals = series.dropna().astype(float).values
+  if len(vals) == 0:
+    return np.zeros(steps, dtype=float)
+  if len(vals) == 1:
+    return np.full(steps, max(0.0, float(vals[0])), dtype=float)
+
+  level = float(vals[0])
+  trend = float(vals[1] - vals[0])
+  for y in vals[1:]:
+    prev_level = level
+    level = alpha * float(y) + (1.0 - alpha) * (level + trend)
+    trend = beta * (level - prev_level) + (1.0 - beta) * trend
+
+  forecasts = [
+      max(0.0, level + h * trend) for h in range(1, steps + 1)
+  ]
+  return np.array(forecasts, dtype=float)
+
+
+def detect_abnormalities(df: pd.DataFrame) -> pd.DataFrame:
+  """Detect duplicates, nulls, negative numbers, zeros, IQR outliers, and bad dates."""
+  flags = []
+  if df is None or df.empty:
+    return pd.DataFrame(flags)
+
+  try:
+    dup_count = int(df.duplicated().sum())
+    if dup_count > 0:
+      flags.append({
+          "Severity": "🚨 Danger",
+          "Type": "Duplicate Rows",
+          "Target": "All Columns",
+          "Detail": f"{dup_count} exact duplicate row(s) detected.",
+      })
+  except Exception:
+    pass
+
+  for col in df.columns:
+    s_col = df[col]
+    missing_cnt = int(s_col.isna().sum())
+    cleaned_cells = s_col.apply(clean_text_cell)
+    blank_str_cnt = max(0, int(cleaned_cells.isna().sum()) - missing_cnt)
+
+    if missing_cnt > 0 or blank_str_cnt > 0:
+      flags.append({
+          "Severity": "⚠️ Warning",
+          "Type": "Missing / Blank Values",
+          "Target": str(col),
+          "Detail": (
+              f"{missing_cnt} null(s) and {blank_str_cnt} blank text entry(ies)."
+          ),
+      })
+
+    num_try = clean_numeric_series(s_col)
+    non_blank_cnt = int(cleaned_cells.notna().sum())
+    valid_ratio = (
+        (num_try.notna().sum() / non_blank_cnt) if non_blank_cnt > 0 else 0.0
+    )
+    if valid_ratio >= 0.6:
+      neg_cnt = int((num_try < 0).sum())
+      zero_cnt = int((num_try == 0).sum())
+      if neg_cnt > 0:
+        flags.append({
+            "Severity": "🚨 Danger",
+            "Type": "Negative Values",
+            "Target": str(col),
+            "Detail": (
+                f"{neg_cnt} negative value(s) found (check for losses, returns,"
+                " or entry errors)."
             ),
+        })
+      if zero_cnt > 0:
+        flags.append({
+            "Severity": "⚠️ Notice",
+            "Type": "Zero Values",
+            "Target": str(col),
+            "Detail": f"{zero_cnt} zero value(s) detected.",
+        })
+      non_null_num = num_try.dropna()
+      if len(non_null_num) >= 4:
+        q1, q3 = np.percentile(non_null_num, [25, 75])
+        iqr = float(q3 - q1)
+        if iqr > 0:
+          outliers = non_null_num[
+              (non_null_num < q1 - 1.5 * iqr)
+              | (non_null_num > q3 + 1.5 * iqr)
+          ]
+          if len(outliers) > 0:
+            flags.append({
+                "Severity": "🚨 Abnormality",
+                "Type": "Statistical Outliers (IQR)",
+                "Target": str(col),
+                "Detail": (
+                    f"{len(outliers)} extreme value(s) outside"
+                    f" [{q1 - 1.5 * iqr:,.2f}, {q3 + 1.5 * iqr:,.2f}]."
+                ),
+            })
+
+    if any(k in str(col).lower() for k in ["date", "time", "dt", "day", "month"]):
+      parsed_dates = pd.to_datetime(cleaned_cells, errors="coerce")
+      failed_dates = max(
+          0, int(parsed_dates.isna().sum()) - int(cleaned_cells.isna().sum())
+      )
+      if failed_dates > 0:
+        flags.append({
+            "Severity": "⚠️ Format Issue",
+            "Type": "Unstandardized / Invalid Dates",
+            "Target": str(col),
+            "Detail": (
+                f"{failed_dates} entry(ies) could not be cleanly parsed as"
+                " dates."
+            ),
+        })
+
+  return pd.DataFrame(flags)
+
+
+# ---------------------------------------------------------
+# AUTHENTICATION GATE
+# ---------------------------------------------------------
+auth_conn = init_auth_db()
+if not render_auth_gate(auth_conn):
+  st.stop()
+
+current_user = st.session_state["auth_user"]
+
+# ---------------------------------------------------------
+# HEADER & LOGGED-IN SESSION CONTROLS
+# ---------------------------------------------------------
+st.title("🌍 Enterprise-Grade Supply Chain & BI Intelligence Suite")
+st.markdown(
+    "Inspired by **Amazon, Jumia, and Alibaba** operational architectures —"
+    " Featuring ABC-XYZ Classification, Safety Stock Buffers, SKU Tiering,"
+    " Universal CSV/Excel Multitask Analysis, Regression & AI Future Diagnosis."
+    " Empowered by **Rogers Enterprises Limited | Ghana**."
+)
+
+# ---------------------------------------------------------
+# SIDEBAR DATA INPUTS, USER PROFILE & SETTINGS
+# ---------------------------------------------------------
+st.sidebar.success(
+    f"👤 **{current_user['full_name']}** (@{current_user['username']})\n"
+    f"Role: `{current_user['role']}`"
+)
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
+  st.session_state.pop("auth_user", None)
+  st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.header("📁 Enterprise Data Inputs")
+sales_file = st.sidebar.file_uploader(
+    "Upload Sales CSV (Columns: Date, ItemName, QuantitySold, UnitPrice)",
+    type=["csv"],
+)
+stock_file = st.sidebar.file_uploader(
+    "Upload Current Stock CSV (Columns: ItemName, CurrentStock, CostPrice,"
+    " SellingPrice, SupplierPhone)",
+    type=["csv"],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Supply Chain Parameters")
+supplier_lead_time = st.sidebar.slider("Supplier Lead Time (Days)", 1, 30, 7)
+service_level_factor = st.sidebar.selectbox(
+    "Service Level Safety Buffer", [1.28, 1.65, 2.05], index=1
+)
+sales_growth_slider = st.sidebar.slider(
+    "Demand Volatility / Growth Simulation (%)", -50, 100, 0, step=5
+)
+
+# ---------------------------------------------------------
+# MODULE 1: ENTERPRISE SUPPLY CHAIN & ABC-XYZ BI ENGINE
+# ---------------------------------------------------------
+if sales_file and stock_file:
+  try:
+    df_sales = pd.read_csv(sales_file)
+    df_stock = pd.read_csv(stock_file)
+
+    item_col_sales = find_col_case_insensitive(df_sales, "ItemName")
+    qty_col_sales = find_col_case_insensitive(df_sales, "QuantitySold")
+    price_col_sales = find_col_case_insensitive(df_sales, "UnitPrice")
+
+    item_col_stock = find_col_case_insensitive(df_stock, "ItemName")
+    curr_stock_col = find_col_case_insensitive(df_stock, "CurrentStock")
+    cost_price_col = find_col_case_insensitive(df_stock, "CostPrice")
+    sell_price_col = find_col_case_insensitive(df_stock, "SellingPrice")
+    phone_col_stock = find_col_case_insensitive(df_stock, "SupplierPhone")
+
+    if not all([item_col_sales, qty_col_sales, price_col_sales]):
+      st.error(
+          "Sales CSV must include ItemName, QuantitySold, and UnitPrice columns."
+      )
+    elif not all([item_col_stock, curr_stock_col, cost_price_col]):
+      st.error(
+          "Stock CSV must include ItemName, CurrentStock, and CostPrice"
+          " columns."
+      )
+    else:
+      df_sales = df_sales.copy()
+      df_stock = df_stock.copy()
+      df_sales["_item"] = df_sales[item_col_sales].apply(clean_text_cell)
+      df_sales["_qty"] = clean_numeric_series(df_sales[qty_col_sales]).fillna(0.0)
+      df_sales["_price"] = clean_numeric_series(
+          df_sales[price_col_sales]
+      ).fillna(0.0)
+      df_sales["TotalRevenue"] = df_sales["_qty"] * df_sales["_price"]
+
+      item_sales = (
+          df_sales.dropna(subset=["_item"])
+          .groupby("_item", as_index=False)
+          .agg(
+              QuantitySold=("_qty", "sum"),
+              OrderCount=("_qty", "count"),
+              QtyStd=("_qty", "std"),
+              TotalRevenue=("TotalRevenue", "sum"),
+          )
+          .rename(columns={"_item": "ItemName"})
+      )
+      item_sales["QtyStd"] = item_sales["QtyStd"].fillna(0.0)
+
+      df_stock["ItemName"] = df_stock[item_col_stock].apply(clean_text_cell)
+      df_stock["CurrentStock"] = clean_numeric_series(
+          df_stock[curr_stock_col]
+      ).fillna(0.0)
+      df_stock["CostPrice"] = clean_numeric_series(
+          df_stock[cost_price_col]
+      ).fillna(0.0)
+      if sell_price_col:
+        df_stock["SellingPrice"] = clean_numeric_series(
+            df_stock[sell_price_col]
+        ).fillna(df_stock["CostPrice"] * 1.3)
+      else:
+        df_stock["SellingPrice"] = df_stock["CostPrice"] * 1.3
+      if phone_col_stock:
+        df_stock["SupplierPhone"] = df_stock[phone_col_stock].apply(
+            clean_text_cell
         )
-        return True, f"{tx_type} recorded: {qty} × {prod.get('name', '')} (Total: {total_amount:,.2f})."
 
-    try:
-        ok, msg = run_write_tx(_op)
-        if ok:
-            log_audit(actor, f"TX_{tx_type}", f"product_id={product_id} sku={clean_sku} qty={qty}")
-        return ok, msg
-    except Exception as exc:
-        logger.exception("Stock movement failed for product %s", product_id)
-        return False, f"Transaction failed: {exc}"
+      df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
+      df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0.0)
+      df_analysis["OrderCount"] = df_analysis["OrderCount"].fillna(0.0)
+      df_analysis["QtyStd"] = df_analysis["QtyStd"].fillna(0.0)
+      df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0.0)
 
+      df_analysis["TotalPotentialRevenue"] = (
+          df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
+      )
+      df_analysis["CapitalTiedUp"] = (
+          df_analysis["CurrentStock"] * df_analysis["CostPrice"]
+      )
+      df_analysis["PotentialProfit"] = (
+          df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
+      )
 
-def process_sales_against_stock_csv(df_sales: pd.DataFrame, actor: str) -> tuple[int, list[str]]:
-    """Process bulk SALE rows against current stock levels in Neon."""
-    cols = {str(c).strip().lower(): c for c in df_sales.columns}
-    sku_col = cols.get("sku") or cols.get("product_sku") or cols.get("item_sku")
-    qty_col = cols.get("quantity") or cols.get("qty") or cols.get("sold_qty") or cols.get("units")
-    price_col = cols.get("unit_price") or cols.get("price") or cols.get("selling_price")
-    notes_col = cols.get("notes") or cols.get("reference") or cols.get("ref")
+      days_analyzed = 30.0
+      base_velocity = df_analysis["QuantitySold"] / days_analyzed
+      df_analysis["SimulatedVelocity"] = base_velocity * (
+          1.0 + (sales_growth_slider / 100.0)
+      )
 
-    if not sku_col or not qty_col:
-        return 0, ["CSV must contain 'sku' (or 'product_sku') and 'quantity' (or 'qty') columns."]
+      # Coefficient of variation (CV) for XYZ demand stability classification
+      mean_qty = np.where(
+          df_analysis["OrderCount"] > 0,
+          df_analysis["QuantitySold"] / np.maximum(df_analysis["OrderCount"], 1.0),
+          0.0,
+      )
+      df_analysis["DemandCV"] = np.where(
+          mean_qty > 0, df_analysis["QtyStd"] / mean_qty, 0.0
+      )
 
-    processed = 0
-    errors: list[str] = []
+      def classify_xyz(cv: float) -> str:
+        if cv <= 0.5:
+          return "X (Steady Demand)"
+        if cv <= 1.0:
+          return "Y (Variable Demand)"
+        return "Z (Erratic / Lumpy)"
 
-    for idx, row in df_sales.iterrows():
-        sku_val = str(row.get(sku_col, "") if pd.notna(row.get(sku_col)) else "").strip().upper()
-        qty_val = safe_int(row.get(qty_col), 0)
-        if not sku_val:
-            errors.append(f"Row {idx + 1}: Missing SKU.")
-            continue
-        if qty_val <= 0:
-            errors.append(f"Row {idx + 1} ({sku_val}): Quantity must be greater than 0.")
-            continue
+      df_analysis["XYZ_Class"] = df_analysis["DemandCV"].apply(classify_xyz)
 
-        custom_p = None
-        if price_col and pd.notna(row.get(price_col)):
-            parsed_p = safe_float(row.get(price_col), -1.0)
-            if parsed_p >= 0:
-                custom_p = parsed_p
+      df_analysis["SafetyStock"] = (
+          df_analysis["SimulatedVelocity"]
+          * 0.2
+          * supplier_lead_time
+          * float(service_level_factor)
+      ).apply(lambda x: max(1, int(round(x))) if pd.notna(x) else 1)
 
-        note_val = (
-            str(row.get(notes_col, "") if pd.notna(row.get(notes_col)) else "").strip()
-            or "Bulk sales against stock CSV"
+      df_analysis["ReorderPoint"] = (
+          df_analysis["SimulatedVelocity"] * supplier_lead_time
+          + df_analysis["SafetyStock"]
+      ).apply(lambda x: int(round(x)) if pd.notna(x) else 0)
+
+      df_analysis["DaysLeft"] = df_analysis.apply(
+          lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
+          if row["SimulatedVelocity"] > 0
+          else 999,
+          axis=1,
+      )
+      today = datetime.now()
+      df_analysis["StockoutDate"] = df_analysis["DaysLeft"].apply(
+          lambda d: (today + timedelta(days=int(min(d, 3650)))).strftime(
+              "%Y-%m-%d"
+          )
+          if pd.notna(d) and d < 999
+          else "No Risk"
+      )
+
+      df_analysis = df_analysis.sort_values(
+          by="TotalRevenue", ascending=False
+      ).reset_index(drop=True)
+      df_analysis["CumulativeRevenue"] = df_analysis["TotalRevenue"].cumsum()
+      total_rev_sum = float(df_analysis["TotalRevenue"].sum())
+      if total_rev_sum > 0:
+        df_analysis["CumulativePct"] = (
+            df_analysis["CumulativeRevenue"] / total_rev_sum
         )
+      else:
+        df_analysis["CumulativePct"] = 0.0
 
-        ok, msg = record_stock_movement(
-            product_id=None,
-            tx_type="SALE",
-            quantity=qty_val,
-            custom_price=custom_p,
-            notes=note_val,
-            actor=actor,
-            sku_fallback=sku_val,
+      def classify_abc(pct: float) -> str:
+        if pct <= 0.80:
+          return "Class A (High Value - Strict Control)"
+        if pct <= 0.95:
+          return "Class B (Moderate Value)"
+        return "Class C (Long-Tail / Bulk)"
+
+      df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(
+          classify_abc
+      )
+      df_analysis["ABC_XYZ_Matrix"] = (
+          df_analysis["ABC_Category"].str.slice(0, 7)
+          + " + "
+          + df_analysis["XYZ_Class"].str.slice(0, 1)
+      )
+
+      def sku_tier(row) -> str:
+        if row["SimulatedVelocity"] >= 5:
+          return "🔥 Best Seller (Fast Moving)"
+        if row["SimulatedVelocity"] >= 1:
+          return "⚡ Steady Mover"
+        if row["CurrentStock"] > 10 and row["SimulatedVelocity"] < 0.2:
+          return "⚠️ Dead Stock / Capital Trap"
+        return "💤 Slow Moving"
+
+      df_analysis["SKU_Tier"] = df_analysis.apply(sku_tier, axis=1)
+
+      df_analysis["RecommendedOrderQty"] = df_analysis.apply(
+          lambda row: max(
+              0,
+              int(
+                  round(
+                      (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
+                      - row["CurrentStock"]
+                  )
+              ),
+          ),
+          axis=1,
+      )
+      df_analysis["EstimatedOrderCost"] = (
+          df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
+      )
+
+      st.markdown("### 📊 Enterprise Executive Performance Metrics")
+      col1, col2, col3, col4, col5 = st.columns(5)
+      col1.metric(
+          "Total Stock Capital",
+          f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}",
+      )
+      col2.metric(
+          "Projected Gross Profit",
+          f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
+      )
+      col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
+      col4.metric(
+          "Class A Core Items",
+          len(
+              df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
+          ),
+      )
+      col5.metric(
+          "Dead Stock Traps",
+          len(df_analysis[df_analysis["SKU_Tier"].str.contains("Dead Stock")]),
+      )
+      st.markdown("---")
+
+      col_ch1, col_ch2 = st.columns(2)
+      with col_ch1:
+        st.subheader("🌍 ABC Inventory Classification Breakdown")
+        fig_abc = px.pie(
+            df_analysis,
+            names="ABC_Category",
+            values="TotalRevenue",
+            color="ABC_Category",
+            color_discrete_map={
+                "Class A (High Value - Strict Control)": "#FF4B4B",
+                "Class B (Moderate Value)": "#FFA500",
+                "Class C (Long-Tail / Bulk)": "#2ECC71",
+            },
         )
-        if ok:
-            processed += 1
-        else:
-            errors.append(f"Row {idx + 1} ({sku_val}): {msg}")
-
-    if processed > 0:
-        log_audit(actor, "CSV_BULK_SALES", f"Processed {processed} sale rows against stock")
-    return processed, errors
-
-
-def delete_product(product_id: int, actor_role: str, actor: str) -> tuple[bool, str]:
-    if actor_role != "admin":
-        return False, "Only administrators can delete products."
-
-    def _op(cur):
-        cur.execute("DELETE FROM products WHERE id = %s RETURNING sku, name;", (int(product_id),))
-        return cur.fetchone()
-
-    try:
-        deleted = run_write_tx(_op)
-        if not deleted:
-            return False, "Product not found."
-        log_audit(actor, "PRODUCT_DELETED", f"{deleted.get('sku')} ({deleted.get('name')})")
-        return True, f"Deleted {deleted.get('sku')} — {deleted.get('name')}."
-    except Exception as exc:
-        logger.exception("Delete product %s failed", product_id)
-        return False, f"Delete failed: {exc}"
-
-
-def fetch_transactions(days: int = 90) -> pd.DataFrame:
-    empty_cols = [
-        "id", "tx_type", "sku", "product_name", "quantity",
-        "unit_price", "total_amount", "recorded_by", "notes", "created_at",
-    ]
-    try:
-        run_write_tx(_heal_transactions_table)
-        cutoff = utc_now() - timedelta(days=max(1, safe_int(days, 90)))
-        df = run_read_query(
-            """
-            SELECT
-                id,
-                tx_type,
-                sku,
-                product_name,
-                quantity,
-                unit_price,
-                total_amount,
-                recorded_by,
-                notes,
-                created_at
-            FROM transactions
-            WHERE created_at >= %s
-            ORDER BY created_at DESC, id DESC;
-            """,
-            (cutoff,),
+        st.plotly_chart(fig_abc, use_container_width=True)
+      with col_ch2:
+        st.subheader("⚡ SKU Velocity vs Stock Level (Jumia Matrix)")
+        fig_jumia = px.scatter(
+            df_analysis,
+            x="CurrentStock",
+            y="SimulatedVelocity",
+            color="SKU_Tier",
+            size="CapitalTiedUp",
+            hover_data=["ItemName", "DaysLeft", "ABC_XYZ_Matrix"],
         )
-        if df.empty:
-            return pd.DataFrame(columns=empty_cols)
-        df["quantity"] = df["quantity"].apply(safe_int)
-        df["unit_price"] = df["unit_price"].apply(safe_float)
-        df["total_amount"] = df["total_amount"].apply(safe_float)
-        return df
-    except Exception as exc:
-        st.error(f"Failed to load transactions: {exc}")
-        return pd.DataFrame(columns=empty_cols)
+        st.plotly_chart(fig_jumia, use_container_width=True)
+      st.markdown("---")
 
+      st.subheader(
+          "🔮 Master Enterprise Supply Chain & Replenishment Dashboard"
+      )
+      display_cols = [
+          c
+          for c in [
+              "ItemName",
+              "ABC_Category",
+              "XYZ_Class",
+              "ABC_XYZ_Matrix",
+              "SKU_Tier",
+              "CurrentStock",
+              "SafetyStock",
+              "ReorderPoint",
+              "DaysLeft",
+              "StockoutDate",
+              "CapitalTiedUp",
+              "RecommendedOrderQty",
+              "EstimatedOrderCost",
+          ]
+          if c in df_analysis.columns
+      ]
+      st.dataframe(df_analysis[display_cols], use_container_width=True)
 
-def fetch_audit_logs(limit: int = 100) -> pd.DataFrame:
-    try:
-        run_write_tx(_heal_audit_logs_table)
-        return run_read_query(
-            """
-            SELECT id, username, action, details, created_at
-            FROM audit_logs
-            ORDER BY created_at DESC, id DESC
-            LIMIT %s;
-            """,
-            (max(1, min(safe_int(limit, 100), 1000)),),
+      st.markdown("---")
+      st.subheader("📱 Automated Enterprise WhatsApp Supplier Dispatcher")
+      reorder_needed_df = df_analysis[
+          df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
+      ]
+      if not reorder_needed_df.empty:
+        selected_sku = st.selectbox(
+            "Select SKU to Dispatch Purchase Order",
+            reorder_needed_df["ItemName"].dropna().astype(str).tolist(),
         )
-    except Exception as exc:
-        st.error(f"Failed to load audit logs: {exc}")
-        return pd.DataFrame()
-
-# ==============================================================================
-# 6. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
-# ==============================================================================
-def _copyright_span() -> str:
-    curr_year = date.today().year
-    return "2025" if curr_year <= 2025 else f"2025–{curr_year}"
-
-
-def render_developer_footer():
-    st.divider()
-    st.caption(
-        f"© {_copyright_span()} **{DEVELOPER_COMPANY}** • "
-        f"Contact: `{DEVELOPER_EMAIL}` • Dev: **{DEVELOPER_HANDLE}** (`@{DEVELOPER_GITHUB}`) • "
-        "All rights reserved."
-    )
-
-
-def maybe_show_daily_welcome(user: dict):
-    """Show a daily welcome banner once per calendar day per signed-in user."""
-    today_str = date.today().isoformat()
-    uname = str(user.get("username") or "user").lower()
-    seen_key = f"daily_welcome_shown_{uname}"
-    if st.session_state.get(seen_key) != today_str:
-        st.session_state[seen_key] = today_str
-        display_name = user.get("full_name") or user.get("username") or "Team Member"
-        role_label = str(user.get("role") or "staff").capitalize()
+        sku_row = reorder_needed_df[
+            reorder_needed_df["ItemName"] == selected_sku
+        ].iloc[0]
+        raw_phone = (
+            sku_row["SupplierPhone"]
+            if "SupplierPhone" in sku_row and pd.notna(sku_row["SupplierPhone"])
+            else "233000000000"
+        )
+        digits_only = "".join(ch for ch in str(raw_phone) if ch.isdigit())
+        sup_phone = digits_only if digits_only else "233000000000"
+        order_msg = (
+            "Hello Supplier, automated reorder generated by Rogers Enterprise"
+            f" Suite. Item: *{sku_row['ItemName']}* | Matrix:"
+            f" *{sku_row['ABC_XYZ_Matrix']}* | Restock Quantity Required:"
+            f" *{sku_row['RecommendedOrderQty']} units* | Estimated PO Cost:"
+            f" *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
+            " fulfillment."
+        )
+        encoded_po = urllib.parse.quote(order_msg)
+        po_wa_url = f"https://wa.me/{sup_phone}?text={encoded_po}"
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+          st.info(
+              f"**Item:** {sku_row['ItemName']} | **Matrix:**"
+              f" {sku_row['ABC_XYZ_Matrix']} | **Current Stock:**"
+              f" {sku_row['CurrentStock']} | **Reorder Point (ROP):**"
+              f" {sku_row['ReorderPoint']} | **Order Qty:**"
+              f" {sku_row['RecommendedOrderQty']} units"
+          )
+        with col_p2:
+          st.markdown(
+              f'<a href="{po_wa_url}" target="_blank" style="display:block;'
+              " text-align:center; background-color:#25D366; color:white;"
+              " padding:12px 15px; border-radius:6px; text-decoration:none;"
+              ' font-weight:bold; font-size:14px;">💬 Send WhatsApp PO</a>',
+              unsafe_allow_html=True,
+          )
+      else:
         st.success(
-            f"Welcome back, **{display_name}** (`@{uname}` • {role_label})! "
-            f"Wishing you a smooth and productive day on {date.today().strftime('%A, %B %d, %Y')}."
+            "🎉 All inventory SKUs are safely above their Reorder Points (ROP)!"
         )
 
+      st.markdown("---")
+      st.subheader("📥 Export Enterprise Intelligence Report")
+      csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
+      st.download_button(
+          label="Download Enterprise Inventory & ABC-XYZ Report (CSV)",
+          data=csv_bytes,
+          file_name="enterprise_bi_inventory_report.csv",
+          mime="text/csv",
+      )
+  except Exception as e:
+    st.error(f"Error processing files: {e}")
+else:
+  st.info(
+      "👈 Please upload your Sales CSV and Current Stock CSV in the sidebar to"
+      " launch the Enterprise BI Suite."
+  )
 
-# ==============================================================================
-# 7. AUTHENTICATION & PASSWORD RECOVERY UI
-# ==============================================================================
-def render_auth_screen():
-    st.title("Enterprise AI Inventory & BI Command Centre")
-    st.caption(
-        f"{DEVELOPER_COMPANY} • {DEVELOPER_EMAIL} • "
-        "Sign in, register a staff account, or recover a forgotten password."
+# ---------------------------------------------------------
+# MODULE 2: UNIVERSAL CSV / EXCEL MULTITASK DATA LAB
+# ---------------------------------------------------------
+st.markdown("---")
+st.header("🧪 Universal CSV & Excel Multitask Data Lab")
+st.markdown(
+    "Upload **any CSV or Excel file** (`.csv`, `.xlsx`, `.xls`) to multitask"
+    " analysis, flag dangers/abnormalities, command cleaning or keep raw"
+    " formatting, format dates on button click, highlight fixed areas, run"
+    " swift statistical, correlation & regression calculations, and get **AI Data"
+    " Diagnosis for Future Outlook**."
+)
+
+lab_file = st.file_uploader(
+    "Upload Any CSV or Excel File for Multitask Analysis",
+    type=["csv", "xlsx", "xls"],
+    key="universal_lab_file",
+)
+
+if lab_file is not None:
+  file_sig = f"{lab_file.name}_{lab_file.size}"
+  if st.session_state.get("lab_file_sig") != file_sig:
+    st.session_state["lab_file_sig"] = file_sig
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
+    st.session_state["lab_fix_highlights"] = []
+
+  if "lab_working_df" not in st.session_state:
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
+    st.session_state["lab_fix_highlights"] = []
+
+  work_df = st.session_state["lab_working_df"].copy()
+
+  k1, k2, k3, k4 = st.columns(4)
+  k1.metric("Rows", f"{len(work_df):,}")
+  k2.metric("Columns", f"{len(work_df.columns):,}")
+  k3.metric("Missing Cells", f"{int(work_df.isna().sum().sum()):,}")
+  try:
+    dup_total = int(work_df.duplicated().sum())
+  except Exception:
+    dup_total = 0
+  k4.metric("Duplicate Rows", f"{dup_total:,}")
+
+  st.subheader("🚨 Dangers & Abnormalities Scanner")
+  df_flags = detect_abnormalities(work_df)
+  if not df_flags.empty:
+    st.dataframe(df_flags, use_container_width=True)
+  else:
+    st.success(
+        "✅ No major dangers, outliers, duplicates, or missing-value"
+        " abnormalities detected."
     )
 
-    _, col_center, _ = st.columns([1, 2, 1])
-    with col_center:
-        tab_login, tab_register, tab_recover = st.tabs(["Sign In", "Sign Up (Staff)", "Recover Password"])
+  st.subheader("🧭 Formatting Prompts & Action Commands")
+  st.caption(
+      "Review areas prompted for formatting and choose **Clean & Format** or"
+      " **Do Not Clean (Skip)** for each item before executing."
+  )
 
-        with tab_login:
-            with st.form("login_form", clear_on_submit=False):
-                username = st.text_input("Username", placeholder="Enter your username")
-                password = st.text_input("Password", type="password", placeholder="Enter your password")
-                submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
-                if submitted:
-                    user = authenticate_user(username, password)
-                    if user:
-                        st.session_state["auth_user"] = user
-                        log_audit(user["username"], "USER_LOGIN", "Successful sign-in")
-                        st.rerun()
-                    else:
-                        log_audit((username or "").strip().lower() or "unknown", "LOGIN_FAILED", "Invalid credentials")
-                        st.error("Invalid username or password, or account is inactive.")
+  col_headers_dirty = [
+      c for c in work_df.columns if str(c) != " ".join(str(c).strip().split())
+  ]
+  text_cols = [
+      c
+      for c in work_df.columns
+      if work_df[c].dtype == object or pd.api.types.is_string_dtype(work_df[c])
+  ]
+  numeric_candidate_cols = []
+  for c in text_cols:
+    num_s = clean_numeric_series(work_df[c])
+    non_blank = work_df[c].apply(clean_text_cell).dropna()
+    if len(non_blank) > 0 and (num_s.notna().sum() / len(non_blank)) >= 0.7:
+      numeric_candidate_cols.append(c)
 
-        with tab_register:
-            with st.form("register_form", clear_on_submit=True):
-                full_name = st.text_input("Full Name", placeholder="e.g. Kwame Mensah")
-                new_username = st.text_input("Username", placeholder="Lowercase, min 3 chars")
-                new_password = st.text_input("Password", type="password", placeholder="Min 6 characters")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                st.caption("New sign-ups default to `staff`. Admin privileges are assigned only by an administrator.")
-                created = st.form_submit_button("Create Staff Account", use_container_width=True)
-                if created:
-                    if new_password != confirm_password:
-                        st.error("Passwords do not match.")
-                    else:
-                        ok, msg = register_staff_user(new_username, full_name, new_password)
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
+  with st.form("format_command_form"):
+    cmd_headers = (
+        st.radio(
+            "1. Column Headers Whitespace & Casing:",
+            [
+                "Clean & Format (Trim spaces)",
+                "Do Not Clean (Keep as-is)",
+            ],
+            index=0 if col_headers_dirty else 1,
+            horizontal=True,
+        )
+        if col_headers_dirty
+        else "Do Not Clean (Keep as-is)"
+    )
 
-        with tab_recover:
-            st.markdown("#### Step 1: Request a Reset Token")
-            with st.form("request_token_form", clear_on_submit=False):
-                rec_username = st.text_input("Account Username", placeholder="Enter username to recover")
-                req_token = st.form_submit_button("Generate Recovery Token", use_container_width=True)
-                if req_token:
-                    found, token = issue_password_reset_token(rec_username, ttl_minutes=RECOVERY_TOKEN_TTL_MINUTES)
-                    if found and token:
-                        st.session_state["recovery_token_preview"] = token
-                        unit_label = "minute" if RECOVERY_TOKEN_TTL_MINUTES == 1 else "minutes"
-                        st.success(
-                            f"Recovery token generated (valid for {RECOVERY_TOKEN_TTL_MINUTES} {unit_label}). "
-                            "Copy it below to reset the password:"
-                        )
-                        st.code(token, language="text")
-                    else:
-                        st.info("If an active account matches that username, a recovery token has been logged.")
+    cmd_text_trim = st.radio(
+        "2. Text Fields Extra Spaces & Blank Strings ('nan'/'None'):",
+        ["Clean & Format", "Do Not Clean (Skip)"],
+        index=0 if text_cols else 1,
+        horizontal=True,
+    )
 
-            st.markdown("#### Step 2: Set a New Password With Token")
-            default_tok = st.session_state.get("recovery_token_preview", "")
-            with st.form("reset_with_token_form", clear_on_submit=True):
-                token_input = st.text_input("Recovery Token", value=default_tok, placeholder="Paste your recovery token")
-                rec_new_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
-                rec_confirm_pw = st.text_input("Confirm New Password", type="password")
-                reset_btn = st.form_submit_button("Reset Password", type="primary", use_container_width=True)
-                if reset_btn:
-                    if rec_new_pw != rec_confirm_pw:
-                        st.error("New passwords do not match.")
-                    else:
-                        ok, msg = reset_password_with_token(token_input, rec_new_pw)
-                        if ok:
-                            st.session_state.pop("recovery_token_preview", None)
-                            st.success(msg)
-                        else:
-                            st.error(msg)
+    cmd_num_parse = (
+        st.radio(
+            "3. Currency / Comma-Formatted Numeric Text"
+            f" ({', '.join(str(x) for x in numeric_candidate_cols[:4])}):",
+            ["Clean & Format to Numbers", "Do Not Clean (Keep as text)"],
+            index=0,
+            horizontal=True,
+        )
+        if numeric_candidate_cols
+        else "Do Not Clean (Keep as text)"
+    )
 
-        render_developer_footer()
+    cmd_dedup = st.radio(
+        "4. Exact Duplicate Rows:",
+        ["Do Not Clean (Keep duplicates)", "Clean & Remove Duplicates"],
+        index=0,
+        horizontal=True,
+    )
 
+    apply_clean_cmd = st.form_submit_button("⚡ Execute Selected Clean Commands")
 
-# ==============================================================================
-# 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
-# ==============================================================================
-def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
-    st.subheader("Executive KPIs & Alerts")
+  if apply_clean_cmd:
+    applied_notes = []
+    if col_headers_dirty and cmd_headers.startswith("Clean"):
+      rename_map = {
+          c: " ".join(str(c).strip().split()) for c in col_headers_dirty
+      }
+      work_df = work_df.rename(columns=rename_map)
+      applied_notes.append(
+          f"Formatted {len(rename_map)} column header(s):"
+          f" {list(rename_map.values())}"
+      )
 
-    total_skus = len(products_df)
-    total_units = safe_int(products_df["stock_qty"].sum()) if not products_df.empty and "stock_qty" in products_df else 0
-    inventory_cost_val = safe_float(products_df["stock_value"].sum()) if not products_df.empty and "stock_value" in products_df else 0.0
+    if cmd_text_trim.startswith("Clean"):
+      for c in work_df.columns:
+        if (
+            work_df[c].dtype == object
+            or pd.api.types.is_string_dtype(work_df[c])
+        ):
+          work_df[c] = work_df[c].apply(clean_text_cell)
+      applied_notes.append(
+          "Trimmed extra whitespace and standardized blank text markers across"
+          " text columns."
+      )
 
-    low_stock_df = pd.DataFrame()
-    if not products_df.empty and "status" in products_df:
-        low_stock_df = products_df[products_df["status"].isin(["Low Stock", "Out of Stock"])]
+    if numeric_candidate_cols and cmd_num_parse.startswith("Clean"):
+      for c in numeric_candidate_cols:
+        if c in work_df.columns:
+          work_df[c] = clean_numeric_series(work_df[c])
+      applied_notes.append(
+          "Converted currency/symbol numeric strings to clean numbers in:"
+          f" {numeric_candidate_cols}"
+      )
 
-    sales_df = pd.DataFrame()
-    if not tx_df.empty and "tx_type" in tx_df:
-        sales_df = tx_df[tx_df["tx_type"] == "SALE"]
+    if cmd_dedup.startswith("Clean & Remove"):
+      before_len = len(work_df)
+      work_df = work_df.drop_duplicates().reset_index(drop=True)
+      removed_cnt = before_len - len(work_df)
+      applied_notes.append(f"Removed {removed_cnt} exact duplicate row(s).")
 
-    total_sales_rev = safe_float(sales_df["total_amount"].sum()) if not sales_df.empty and "total_amount" in sales_df else 0.0
+    st.session_state["lab_working_df"] = work_df
+    st.session_state["lab_fix_highlights"] = (
+        st.session_state.get("lab_fix_highlights", []) + applied_notes
+    )
+    st.rerun()
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Active SKUs", f"{total_skus:,}")
-    c2.metric("Total Stock Units", f"{total_units:,}")
-    c3.metric("Stock Valuation (Cost)", f"{inventory_cost_val:,.2f}")
-    c4.metric("Recorded Sales Revenue", f"{total_sales_rev:,.2f}")
-    c5.metric("Low / Out of Stock", f"{len(low_stock_df):,}")
+  st.subheader("📅 On-Demand Date Formatter")
+  date_col_candidates = list(work_df.columns)
+  default_date_idx = next(
+      (
+          i
+          for i, c in enumerate(date_col_candidates)
+          if any(k in str(c).lower() for k in ["date", "time", "dt", "day"])
+      ),
+      0,
+  )
+  d_col1, d_col2, d_col3 = st.columns([2, 2, 1])
+  selected_date_col = d_col1.selectbox(
+      "Select Column to Format as Date",
+      date_col_candidates,
+      index=default_date_idx,
+      key="lab_date_col",
+  )
+  target_date_fmt = d_col2.selectbox(
+      "Output Date Format",
+      ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%b %d, %Y", "%Y-%m-%d %H:%M"],
+      index=0,
+      key="lab_date_fmt",
+  )
+  with d_col3:
+    st.markdown("<br>", unsafe_allow_html=True)
+    format_date_btn = st.button(
+        "🗓️ Format Dates", key="btn_format_dates", use_container_width=True
+    )
 
-    st.divider()
+  if format_date_btn:
+    cleaned_d = work_df[selected_date_col].apply(clean_text_cell)
+    parsed = pd.to_datetime(cleaned_d, errors="coerce")
+    valid_parsed = int(parsed.notna().sum())
+    formatted_series = cleaned_d.astype(object)
+    valid_mask = parsed.notna()
+    formatted_series.loc[valid_mask] = parsed.loc[valid_mask].dt.strftime(
+        target_date_fmt
+    )
+    work_df[selected_date_col] = formatted_series
+    st.session_state["lab_working_df"] = work_df
+    note = (
+        f"Formatted column **'{selected_date_col}'** to `{target_date_fmt}`"
+        f" ({valid_parsed:,} date value(s) standardized)."
+    )
+    st.session_state["lab_fix_highlights"] = (
+        st.session_state.get("lab_fix_highlights", []) + [note]
+    )
+    st.rerun()
 
-    if not low_stock_df.empty:
-        st.warning("Attention: The following items are at or below their reorder threshold:")
-        cols = [c for c in ["sku", "name", "category", "stock_qty", "reorder_level", "status"] if c in low_stock_df.columns]
-        st.dataframe(low_stock_df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.success("All inventory items are above their reorder thresholds.")
+  if st.session_state.get("lab_fix_highlights"):
+    st.markdown("#### ✨ Highlighted Fixes & Formatting Applied")
+    for item_note in st.session_state["lab_fix_highlights"]:
+      st.warning(f"🎯 **Fixed & Formatted:** {item_note}")
 
-    st.subheader("Recent Transactions")
-    if not tx_df.empty:
-        st.dataframe(tx_df.head(15), use_container_width=True, hide_index=True)
-    else:
-        st.info("No transactions recorded yet.")
+  st.dataframe(work_df, use_container_width=True)
 
+  st.markdown("---")
+  st.subheader(
+      "📐 Swift Measurements, Correlation & Regression Calculator (Mean,"
+      " Average, Median, COUNT, COUNTA, COUNTIFS)"
+  )
 
-def render_inventory_tab(products_df: pd.DataFrame, user: dict):
-    st.subheader("Inventory Catalog & Stock Movements")
+  numeric_cols_now = [
+      c
+      for c in work_df.columns
+      if (
+          pd.api.types.is_numeric_dtype(work_df[c])
+          and not pd.api.types.is_bool_dtype(work_df[c])
+      )
+      or clean_numeric_series(work_df[c]).notna().sum() > 0
+  ]
 
-    col_left, col_right = st.columns([1, 1.4])
+  if numeric_cols_now:
+    swift_col = st.selectbox(
+        "Select Target Column for Swift Measurements",
+        numeric_cols_now,
+        key="swift_target_col",
+    )
+    num_series = clean_numeric_series(work_df[swift_col])
+    non_empty_counta = int(work_df[swift_col].apply(clean_text_cell).notna().sum())
+    numeric_count = int(num_series.notna().sum())
+    mean_val = float(num_series.mean()) if numeric_count > 0 else 0.0
+    median_val = float(num_series.median()) if numeric_count > 0 else 0.0
 
-    with col_left:
-        st.markdown("#### Record Sale or Restock")
-        if products_df.empty:
-            st.info("Add products first to record stock movements.")
-        else:
-            product_options = {}
-            for _, row in products_df.iterrows():
-                label = f"{row.get('sku', '')} — {row.get('name', '')} (Qty: {safe_int(row.get('stock_qty'))})"
-                product_options[label] = safe_int(row.get("id"))
+    st.markdown("**COUNTIFS Multi-Condition Counter**")
+    cf1, cf2, cf3, cf4 = st.columns(4)
+    cond1_col = cf1.selectbox(
+        "Condition 1 Column", work_df.columns, key="cifs_col1"
+    )
+    cond1_val = cf2.text_input(
+        "Condition 1 Value (equals)", key="cifs_val1"
+    ).strip()
+    cond2_col = cf3.selectbox(
+        "Condition 2 Column", work_df.columns, key="cifs_col2"
+    )
+    cond2_val = cf4.text_input(
+        "Condition 2 Value (optional)", key="cifs_val2"
+    ).strip()
 
-            with st.form("movement_form", clear_on_submit=True):
-                selected_label = st.selectbox("Product", list(product_options.keys()))
-                tx_type = st.selectbox("Movement Type", ["SALE", "RESTOCK"])
-                qty = st.number_input("Quantity", min_value=1, step=1, value=1)
-                override_price = st.number_input(
-                    "Custom Unit Price (0 = use default price/cost)",
-                    min_value=0.0,
-                    step=0.5,
-                    value=0.0,
-                )
-                notes = st.text_input("Notes / Reference", placeholder="e.g. Receipt #104 or Supplier delivery")
-                submitted = st.form_submit_button("Submit Movement", type="primary", use_container_width=True)
-                if submitted:
-                    prod_id = product_options[selected_label]
-                    price_val = None if override_price <= 0 else float(override_price)
-                    ok, msg = record_stock_movement(
-                        product_id=prod_id,
-                        tx_type=tx_type,
-                        quantity=int(qty),
-                        custom_price=price_val,
-                        notes=notes,
-                        actor=user["username"],
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
+    mask_cifs = pd.Series(True, index=work_df.index)
+    if cond1_val:
+      mask_cifs = mask_cifs & (
+          work_df[cond1_col]
+          .apply(clean_text_cell)
+          .fillna("")
+          .astype(str)
+          .str.lower()
+          == cond1_val.lower()
+      )
+    if cond2_val:
+      mask_cifs = mask_cifs & (
+          work_df[cond2_col]
+          .apply(clean_text_cell)
+          .fillna("")
+          .astype(str)
+          .str.lower()
+          == cond2_val.lower()
+      )
+    countifs_result = int(mask_cifs.sum()) if (cond1_val or cond2_val) else 0
 
-        st.markdown("#### Add or Update Product")
-        with st.form("product_form", clear_on_submit=True):
-            sku = st.text_input("SKU", placeholder="e.g. SKU-1005")
-            name = st.text_input("Product Name", placeholder="e.g. Barcode Label Printer")
-            category = st.text_input("Category", value="General")
-            col_c, col_p = st.columns(2)
-            unit_cost = col_c.number_input("Unit Cost", min_value=0.0, step=0.5, value=0.0)
-            selling_price = col_p.number_input("Selling Price", min_value=0.0, step=0.5, value=0.0)
-            col_q, col_r = st.columns(2)
-            stock_qty = col_q.number_input("Stock Quantity", min_value=0, step=1, value=0)
-            reorder_level = col_r.number_input("Reorder Level", min_value=0, step=1, value=10)
-            saved = st.form_submit_button("Save Product", use_container_width=True)
-            if saved:
-                ok, msg = add_or_update_product(
-                    sku=sku,
-                    name=name,
-                    category=category,
-                    unit_cost=float(unit_cost),
-                    selling_price=float(selling_price),
-                    stock_qty=int(stock_qty),
-                    reorder_level=int(reorder_level),
-                    actor=user["username"],
-                )
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("Mean", f"{mean_val:,.2f}")
+    s2.metric("Average", f"{mean_val:,.2f}")
+    s3.metric("Median", f"{median_val:,.2f}")
+    s4.metric("COUNT (Numeric)", f"{numeric_count:,}")
+    s5.metric("COUNTA (Non-Empty)", f"{non_empty_counta:,}")
+    s6.metric("COUNTIFS", f"{countifs_result:,}")
 
-    with col_right:
-        st.markdown("#### Current Stock Table")
-        if products_df.empty:
-            st.info("No products found.")
-        else:
-            search_q = st.text_input("Filter by SKU, Name, or Category", placeholder="Type to filter...")
-            filtered = products_df.copy()
-            if search_q and search_q.strip():
-                q = search_q.strip().lower()
-                mask = pd.Series(False, index=filtered.index)
-                for col in ["sku", "name", "category"]:
-                    if col in filtered.columns:
-                        mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(q, regex=False)
-                filtered = filtered[mask]
+    st.markdown("---")
+    st.markdown("**📈 Linear Regression Calculator ($Y = mX + b$)**")
+    if len(numeric_cols_now) >= 2:
+      rc1, rc2, rc3 = st.columns(3)
+      x_col = rc1.selectbox(
+          "Independent Variable (X)",
+          numeric_cols_now,
+          index=0,
+          key="reg_x_col",
+      )
+      y_col = rc2.selectbox(
+          "Dependent Variable (Y)",
+          numeric_cols_now,
+          index=min(1, len(numeric_cols_now) - 1),
+          key="reg_y_col",
+      )
+      x_vals = clean_numeric_series(work_df[x_col])
+      y_vals = clean_numeric_series(work_df[y_col])
+      reg_df = pd.DataFrame({"x": x_vals, "y": y_vals}).dropna()
 
-            st.dataframe(filtered, use_container_width=True, hide_index=True)
+      if len(reg_df) >= 2 and reg_df["x"].nunique() > 1:
+        slope, intercept = np.polyfit(reg_df["x"], reg_df["y"], 1)
+        y_pred = slope * reg_df["x"] + intercept
+        ss_res = np.sum((reg_df["y"] - y_pred) ** 2)
+        ss_tot = np.sum((reg_df["y"] - reg_df["y"].mean()) ** 2)
+        r_squared = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
 
-            csv_buf = io.StringIO()
-            filtered.to_csv(csv_buf, index=False)
-            st.download_button(
-                label="Download Filtered Inventory CSV",
-                data=csv_buf.getvalue(),
-                file_name=f"inventory_{date.today().isoformat()}.csv",
-                mime="text/csv",
+        predict_x = rc3.number_input(
+            f"Predict {y_col} for {x_col} =",
+            value=float(reg_df["x"].mean()),
+            key="reg_pred_x",
+        )
+        predicted_y = float(slope * predict_x + intercept)
+
+        rm1, rm2, rm3, rm4 = st.columns(4)
+        rm1.metric("Slope (m)", f"{slope:,.4f}")
+        rm2.metric("Intercept (b)", f"{intercept:,.4f}")
+        rm3.metric("R² Score", f"{r_squared:,.4f}")
+        rm4.metric(f"Predicted {y_col}", f"{predicted_y:,.2f}")
+
+        fig_reg = go.Figure()
+        fig_reg.add_trace(
+            go.Scatter(
+                x=reg_df["x"],
+                y=reg_df["y"],
+                mode="markers",
+                name="Actual Data",
             )
-
-            if user.get("role") == "admin":
-                st.markdown("##### Admin: Delete Product")
-                del_map = {
-                    f"{r.get('sku', '')} — {r.get('name', '')}": safe_int(r.get("id"))
-                    for _, r in products_df.iterrows()
-                }
-                if del_map:
-                    del_choice = st.selectbox("Select product to remove", list(del_map.keys()), key="del_prod_select")
-                    if st.button("Delete Selected Product", type="secondary"):
-                        ok, msg = delete_product(
-                            del_map[del_choice],
-                            actor_role=user.get("role", "staff"),
-                            actor=user["username"],
-                        )
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-
-def render_bi_analytics_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
-    st.subheader("Business Intelligence & Analytics")
-
-    if not products_df.empty and {"category", "stock_value"}.issubset(products_df.columns):
-        st.markdown("#### Stock Value by Category")
-        agg_cols = [c for c in ["stock_qty", "stock_value", "retail_value"] if c in products_df.columns]
-        cat_summary = (
-            products_df.groupby("category", as_index=False)[agg_cols]
-            .sum()
-            .sort_values("stock_value", ascending=False)
         )
-        hover_cols = [c for c in ["stock_qty", "retail_value"] if c in cat_summary.columns]
-        fig_cat = px.bar(
-            cat_summary,
-            x="category",
-            y="stock_value",
-            hover_data=hover_cols,
-            title="Inventory Cost Valuation by Category",
+        sorted_x = np.sort(reg_df["x"])
+        fig_reg.add_trace(
+            go.Scatter(
+                x=sorted_x,
+                y=slope * sorted_x + intercept,
+                mode="lines",
+                name=f"Fit: y = {slope:.2f}x + {intercept:.2f}",
+            )
         )
-        st.plotly_chart(fig_cat, use_container_width=True)
+        fig_reg.update_layout(
+            xaxis_title=str(x_col),
+            yaxis_title=str(y_col),
+            title=f"Regression Trend: {y_col} vs {x_col}",
+        )
+        st.plotly_chart(fig_reg, use_container_width=True)
 
-    if not tx_df.empty and {"tx_type", "created_at", "total_amount"}.issubset(tx_df.columns):
-        sales_only = tx_df[tx_df["tx_type"] == "SALE"].copy()
-        if not sales_only.empty:
-            sales_only["date"] = pd.to_datetime(sales_only["created_at"], utc=True, errors="coerce").dt.date
-            sales_only = sales_only.dropna(subset=["date"])
-            if not sales_only.empty:
-                daily_sales = sales_only.groupby("date", as_index=False)["total_amount"].sum()
-
-                st.markdown("#### Daily Sales Trend")
-                fig_sales = px.line(
-                    daily_sales,
-                    x="date",
-                    y="total_amount",
-                    markers=True,
-                    title="Daily Revenue From Recorded Sales",
-                )
-                st.plotly_chart(fig_sales, use_container_width=True)
-
-            group_cols = [c for c in ["sku", "product_name"] if c in sales_only.columns]
-            metric_cols = [c for c in ["quantity", "total_amount"] if c in sales_only.columns]
-            if group_cols and metric_cols:
-                st.markdown("#### Top Selling Products by Revenue")
-                top_prods = (
-                    sales_only.groupby(group_cols, as_index=False)[metric_cols]
-                    .sum()
-                    .sort_values("total_amount", ascending=False)
-                    .head(10)
-                )
-                st.dataframe(top_prods, use_container_width=True, hide_index=True)
-        else:
-            st.info("Record SALE movements in the Inventory tab to populate sales charts.")
+        # Pairwise correlation ranking across numeric features
+        clean_num_frame = pd.DataFrame(
+            {str(c): clean_numeric_series(work_df[c]) for c in numeric_cols_now}
+        ).dropna(how="all")
+        if len(clean_num_frame.columns) >= 2 and len(clean_num_frame) >= 2:
+          corr_matrix = clean_num_frame.corr(numeric_only=True)
+          st.markdown("**🔗 Numeric Correlation Matrix**")
+          st.dataframe(corr_matrix.round(3), use_container_width=True)
+      else:
+        st.info(
+            "Need at least 2 valid numeric pairs with variation in X to fit a"
+            " regression line."
+        )
     else:
-        st.info("No transaction data available for analytics yet.")
+      st.info(
+          "Upload or clean at least two numeric columns to run linear"
+          " regression."
+      )
 
-
-def render_bulk_import_tab(user: dict):
-    st.subheader("Bulk CSV Multitask: Product Catalog & Sales Against Stock")
-
-    col_cat, col_sales = st.columns(2)
-
-    with col_cat:
-        st.markdown("#### 1. Bulk CSV Product Catalog Import")
-        st.caption("Columns: `sku`, `name`, `category`, `unit_cost`, `selling_price`, `stock_qty`, `reorder_level`.")
-
-        sample_prod_csv = (
-            "sku,name,category,unit_cost,selling_price,stock_qty,reorder_level\n"
-            "SKU-2001,USB-C Hub 7-Port,Accessories,45.00,75.00,30,10\n"
-            "SKU-2002,A4 Thermal Labels,Supplies,12.00,22.00,50,15\n"
-        )
-        st.download_button(
-            label="Download Sample Product CSV",
-            data=sample_prod_csv,
-            file_name="sample_products_import.csv",
-            mime="text/csv",
-            key="dl_sample_prod_csv",
-        )
-
-        uploaded_prod = st.file_uploader("Choose Product CSV file", type=["csv"], key="upload_prod_csv")
-        if uploaded_prod is not None:
-            try:
-                df_up = pd.read_csv(uploaded_prod)
-                if df_up.empty:
-                    st.warning("Uploaded product CSV is empty.")
-                else:
-                    st.dataframe(df_up.head(20), use_container_width=True, hide_index=True)
-
-                    if st.button("Import Products Into Neon", type="primary", key="btn_import_prod_csv"):
-                        normalized_cols = {str(c).strip().lower() for c in df_up.columns}
-                        if not {"sku", "name"}.issubset(normalized_cols):
-                            st.error("CSV must contain at least 'sku' and 'name' columns.")
-                        else:
-                            df_up.columns = [str(c).strip().lower() for c in df_up.columns]
-                            imported = 0
-                            errors = []
-                            for idx, row in df_up.iterrows():
-                                ok, msg = add_or_update_product(
-                                    sku=str(row.get("sku", "") if pd.notna(row.get("sku")) else ""),
-                                    name=str(row.get("name", "") if pd.notna(row.get("name")) else ""),
-                                    category=str(row.get("category", "General")) if pd.notna(row.get("category")) else "General",
-                                    unit_cost=safe_float(row.get("unit_cost"), 0.0),
-                                    selling_price=safe_float(row.get("selling_price"), 0.0),
-                                    stock_qty=safe_int(row.get("stock_qty"), 0),
-                                    reorder_level=safe_int(row.get("reorder_level"), 10),
-                                    actor=user["username"],
-                                )
-                                if ok:
-                                    imported += 1
-                                else:
-                                    errors.append(f"Row {idx + 1}: {msg}")
-
-                            log_audit(user["username"], "CSV_BULK_IMPORT", f"Imported {imported} rows")
-                            st.success(f"Imported/updated {imported} products.")
-                            if errors:
-                                st.warning("\n".join(errors))
-                            st.rerun()
-            except Exception as exc:
-                st.error(f"Could not read product CSV: {exc}")
-
-    with col_sales:
-        st.markdown("#### 2. Import Sales Against Stock CSV")
-        st.caption("Deducts sold quantities from matching `sku` stock and records `SALE` transactions. Optional: `unit_price`, `notes`.")
-
-        sample_sales_csv = (
-            "sku,quantity,unit_price,notes\n"
-            "SKU-1001,2,260.00,Batch Sale #1\n"
-            "SKU-1002,10,12.00,Batch Sale #2\n"
-        )
-        st.download_button(
-            label="Download Sample Sales Against Stock CSV",
-            data=sample_sales_csv,
-            file_name="sample_sales_against_stock.csv",
-            mime="text/csv",
-            key="dl_sample_sales_csv",
-        )
-
-        uploaded_sales = st.file_uploader("Choose Sales CSV file", type=["csv"], key="upload_sales_csv")
-        if uploaded_sales is not None:
-            try:
-                df_sales = pd.read_csv(uploaded_sales)
-                if df_sales.empty:
-                    st.warning("Uploaded sales CSV is empty.")
-                else:
-                    st.dataframe(df_sales.head(20), use_container_width=True, hide_index=True)
-
-                    if st.button("Process Sales Against Stock", type="primary", key="btn_import_sales_csv"):
-                        processed, errors = process_sales_against_stock_csv(df_sales, actor=user["username"])
-                        if processed > 0:
-                            st.success(f"Recorded {processed} sales against stock.")
-                        if errors:
-                            st.warning("\n".join(errors))
-                        if processed > 0:
-                            st.rerun()
-            except Exception as exc:
-                st.error(f"Could not read sales CSV: {exc}")
-
-
-def render_admin_tab(user: dict):
-    st.subheader("User Management & Audit Trail")
-
-    if user.get("role") != "admin":
-        st.error("Access denied: Administrator privileges are required.")
-        return
-
-    users_df = fetch_all_users()
-    st.markdown("#### Registered Users")
-    if not users_df.empty:
-        st.dataframe(users_df, use_container_width=True, hide_index=True)
-
-        user_map = {
-            f"@{r.get('username', '')} — {r.get('full_name', '')} ({r.get('role', 'staff')})": safe_int(r.get("id"))
-            for _, r in users_df.iterrows()
-        }
-        if user_map:
-            col_role, col_reset = st.columns(2)
-
-            with col_role:
-                st.markdown("##### Role & Account Status")
-                with st.form("manage_user_form"):
-                    target_label = st.selectbox("Select User to Manage", list(user_map.keys()), key="role_target_user")
-                    new_role = st.selectbox("Assign Role", ["staff", "admin"])
-                    new_active = st.checkbox("Active Account", value=True)
-                    apply_btn = st.form_submit_button("Save User Role & Status", type="primary", use_container_width=True)
-                    if apply_btn:
-                        ok, msg = update_user_role_or_status(
-                            user_id=user_map[target_label],
-                            role=new_role,
-                            is_active=new_active,
-                            actor_role=user.get("role", "staff"),
-                            actor=user["username"],
-                        )
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-            with col_reset:
-                st.markdown("##### Reset User Password")
-                with st.form("admin_reset_password_form", clear_on_submit=True):
-                    reset_target_label = st.selectbox("Select User", list(user_map.keys()), key="reset_target_user")
-                    temp_pw = st.text_input("New / Temporary Password", type="password", placeholder="Min 6 characters")
-                    confirm_temp_pw = st.text_input("Confirm Password", type="password")
-                    reset_user_btn = st.form_submit_button("Reset Password", use_container_width=True)
-                    if reset_user_btn:
-                        if temp_pw != confirm_temp_pw:
-                            st.error("Passwords do not match.")
-                        else:
-                            ok, msg = admin_reset_user_password(
-                                target_user_id=user_map[reset_target_label],
-                                new_password=temp_pw,
-                                actor_role=user.get("role", "staff"),
-                                actor=user["username"],
-                            )
-                            if ok:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
-    else:
-        st.info("No users found.")
-
-    st.markdown("#### Recent Audit Logs")
-    logs_df = fetch_audit_logs(limit=100)
-    if not logs_df.empty:
-        st.dataframe(logs_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No audit entries recorded yet.")
-
-
-def render_main_app(user: dict):
-    """Render the main dashboard with role-gated tabs (staff: 2 tabs, admin: 5 tabs)."""
-    is_admin = user.get("role") == "admin"
-
-    with st.sidebar:
-        st.markdown(f"### {user.get('full_name') or user.get('username')}")
-        st.caption(f"@{user.get('username')} • Role: `{user.get('role', 'staff')}`")
-        days_window = st.selectbox("Analytics History Window", [7, 30, 90, 365], index=2)
-
-        with st.expander("Change Password"):
-            with st.form("change_password_form", clear_on_submit=True):
-                curr_pw = st.text_input("Current Password", type="password")
-                next_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
-                confirm_next_pw = st.text_input("Confirm New Password", type="password")
-                chg_btn = st.form_submit_button("Update Password", use_container_width=True)
-                if chg_btn:
-                    if next_pw != confirm_next_pw:
-                        st.error("New passwords do not match.")
-                    else:
-                        ok, msg = change_user_password(user["username"], curr_pw, next_pw)
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-
-        if st.button("Sign Out", use_container_width=True):
-            log_audit(user["username"], "USER_LOGOUT", "Signed out")
-            st.session_state.pop("auth_user", None)
-            st.rerun()
-
-        st.divider()
-        st.caption(
-            f"**{DEVELOPER_COMPANY}**\n\n"
-            f"`{DEVELOPER_EMAIL}`\n\n"
-            f"© {_copyright_span()} {DEVELOPER_COMPANY}"
-        )
-
-    st.title("Enterprise AI Inventory & BI Command Centre")
-    maybe_show_daily_welcome(user)
-
-    products_df = fetch_products()
-    tx_df = fetch_transactions(days=int(days_window))
-
-    tab_labels = ["Overview & KPIs", "Inventory & Sales"]
-    if is_admin:
-        tab_labels.extend(["BI Analytics", "CSV Import", "Users & Audit Log"])
-
-    tabs = st.tabs(tab_labels)
-
-    with tabs[0]:
-        render_overview_tab(products_df, tx_df)
-
-    with tabs[1]:
-        render_inventory_tab(products_df, user)
-
-    if is_admin:
-        with tabs[2]:
-            render_bi_analytics_tab(products_df, tx_df)
-
-        with tabs[3]:
-            render_bulk_import_tab(user)
-
-        with tabs[4]:
-            render_admin_tab(user)
-
-    render_developer_footer()
-
-    
-# ==============================================================================
-# 6. DEVELOPER DETAILS & DAILY LOGIN WELCOME HELPERS
-# ==============================================================================
-def _copyright_span() -> str:
-    curr_year = date.today().year
-    return "2025" if curr_year <= 2025 else f"2025–{curr_year}"
-
-
-def render_developer_footer():
-    st.divider()
+    st.markdown("---")
+    st.subheader("🔮 AI Data Diagnosis & Future Trajectory Outlook")
     st.caption(
-        f"© {_copyright_span()} **{DEVELOPER_COMPANY}** • "
-        f"Contact: `{DEVELOPER_EMAIL}` • Dev: **{DEVELOPER_HANDLE}** (`@{DEVELOPER_GITHUB}`) • "
-        "All rights reserved."
+        "Combines data health scoring, linear momentum, and Holt trend"
+        " smoothing to diagnose future behavior across your dataset."
     )
 
+    ai_col1, ai_col2 = st.columns([2, 1])
+    diag_target_col = ai_col1.selectbox(
+        "Select Metric Column for Future Diagnosis",
+        numeric_cols_now,
+        key="ai_diag_col",
+    )
+    horizon_steps = ai_col2.slider(
+        "Future Periods Ahead",
+        min_value=1,
+        max_value=30,
+        value=7,
+        key="ai_horizon",
+    )
 
-def maybe_show_daily_welcome(user: dict):
-    """Show a daily welcome banner once per calendar day per signed-in user."""
-    today_str = date.today().isoformat()
-    uname = str(user.get("username") or "user").lower()
-    seen_key = f"daily_welcome_shown_{uname}"
-    if st.session_state.get(seen_key) != today_str:
-        st.session_state[seen_key] = today_str
-        display_name = user.get("full_name") or user.get("username") or "Team Member"
-        role_label = str(user.get("role") or "staff").capitalize()
+    diag_series = (
+        clean_numeric_series(work_df[diag_target_col])
+        .dropna()
+        .reset_index(drop=True)
+    )
+    total_cells = max(1, len(work_df) * max(1, len(work_df.columns)))
+    missing_pct = (int(work_df.isna().sum().sum()) / total_cells) * 100.0
+    dup_pct = (dup_total / max(1, len(work_df))) * 100.0
+
+    health_score = (
+        100.0 - min(40.0, missing_pct * 1.5) - min(25.0, dup_pct * 2.0)
+    )
+    if len(diag_series) >= 4:
+      q1_d, q3_d = np.percentile(diag_series, [25, 75])
+      iqr_d = float(q3_d - q1_d)
+      if iqr_d > 0:
+        out_ratio = (
+            (diag_series < q1_d - 1.5 * iqr_d)
+            | (diag_series > q3_d + 1.5 * iqr_d)
+        ).mean() * 100.0
+        health_score -= min(25.0, float(out_ratio) * 1.5)
+    health_score = max(0.0, min(100.0, health_score))
+
+    if len(diag_series) >= 2:
+      t_idx = np.arange(len(diag_series), dtype=float)
+      m_trend, b_trend = np.polyfit(t_idx, diag_series.values, 1)
+      holt_vals = compute_exponential_forecast(
+          diag_series, steps=horizon_steps
+      )
+      linear_future = np.maximum(
+          0.0,
+          m_trend
+          * np.arange(
+              len(diag_series), len(diag_series) + horizon_steps, dtype=float
+          )
+          + b_trend,
+      )
+      blended_future = 0.5 * holt_vals + 0.5 * linear_future
+      avg_future = float(np.mean(blended_future))
+      end_future = float(blended_future[-1])
+      current_last = float(diag_series.iloc[-1])
+
+      if m_trend > 0.01:
+        outlook_label = "📈 Upward Growth Trend"
+      elif m_trend < -0.01:
+        outlook_label = "📉 Downward / Depleting Trend"
+      else:
+        outlook_label = "➡️ Flat / Stable Trend"
+
+      d1, d2, d3, d4 = st.columns(4)
+      d1.metric("AI Data Health Score", f"{health_score:.0f} / 100")
+      d2.metric("Future Direction", outlook_label)
+      d3.metric(f"Avg Next {horizon_steps} Periods", f"{avg_future:,.2f}")
+      d4.metric(
+          f"Period +{horizon_steps} Forecast",
+          f"{end_future:,.2f}",
+          delta=f"{end_future - current_last:+,.2f} vs latest",
+      )
+
+      st.markdown("**🧠 AI Diagnostic Findings & Future Watchpoints:**")
+      if missing_pct > 5:
+        st.warning(
+            f"• **Data Completeness Risk:** {missing_pct:.1f}% of cells are"
+            " missing—future forecasts may shift once blanks are resolved."
+        )
+      if dup_pct > 0:
+        st.warning(
+            f"• **Duplicate Inflation Risk:** {dup_pct:.1f}% duplicate rows"
+            " detected—duplicate records can artificially inflate future"
+            " averages."
+        )
+      if m_trend < -0.01:
+        st.error(
+            f"• **Future Contraction / Depletion Alert:** `{diag_target_col}`"
+            f" is trending downward by `{m_trend:,.2f}` per record. Review"
+            " stock, cashflow, or demand drivers early."
+        )
+      elif m_trend > 0.01:
         st.success(
-            f"Welcome back, **{display_name}** (`@{uname}` • {role_label})! "
-            f"Wishing you a smooth and productive day on {date.today().strftime('%A, %B %d, %Y')}."
+            f"• **Future Expansion Opportunity:** `{diag_target_col}` is"
+            f" trending upward by `+{m_trend:,.2f}` per record. Prepare"
+            " capacity, stock buffers, or budget ahead of demand."
+        )
+      else:
+        st.info(
+            f"• **Steady Baseline:** `{diag_target_col}` shows minimal slope"
+            " change; expect near-term figures to stay close to recent"
+            " averages."
         )
 
-
-# ==============================================================================
-# 7. AUTHENTICATION & PASSWORD RECOVERY UI
-# ==============================================================================
-def render_auth_screen():
-    st.title("Enterprise AI Inventory & BI Command Centre")
-    st.caption(
-        f"{DEVELOPER_COMPANY} • {DEVELOPER_EMAIL} • "
-        "Sign in, register a staff account, or recover a forgotten password."
+      hist_df = pd.DataFrame({
+          "Step": np.arange(1, len(diag_series) + 1),
+          "Value": diag_series.values,
+          "Series": "Historical",
+      })
+      fut_df = pd.DataFrame({
+          "Step": np.arange(
+              len(diag_series) + 1, len(diag_series) + horizon_steps + 1
+          ),
+          "Value": blended_future,
+          "Series": "AI Blended Forecast (Holt + Linear)",
+      })
+      plot_outlook_df = pd.concat([hist_df, fut_df], ignore_index=True)
+      fig_outlook = px.line(
+          plot_outlook_df,
+          x="Step",
+          y="Value",
+          color="Series",
+          markers=True,
+          title=(
+              f"AI Future Trajectory for '{diag_target_col}' (+{horizon_steps}"
+              " Periods)"
+          ),
+      )
+      st.plotly_chart(fig_outlook, use_container_width=True)
+    else:
+      st.info(
+          "Need at least 2 numeric values in the selected column to project a"
+          " future trend."
+      )
+  else:
+    st.info(
+        "No numeric columns detected yet. Use the formatting commands above if"
+        " numbers are stored as text."
     )
 
-    _, col_center, _ = st.columns([1, 2, 1])
-    with col_center:
-        tab_login, tab_register, tab_recover = st.tabs(["Sign In", "Sign Up (Staff)", "Recover Password"])
-
-        with tab_login:
-            with st.form("login_form", clear_on_submit=False):
-                username = st.text_input("Username", placeholder="Enter your username")
-                password = st.text_input("Password", type="password", placeholder="Enter your password")
-                submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
-                if submitted:
-                    user = authenticate_user(username, password)
-                    if user:
-                        st.session_state["auth_user"] = user
-                        log_audit(user["username"], "USER_LOGIN", "Successful sign-in")
-                        st.rerun()
-                    else:
-                        log_audit((username or "").strip().lower() or "unknown", "LOGIN_FAILED", "Invalid credentials")
-                        st.error("Invalid username or password, or account is inactive.")
-
-        with tab_register:
-            with st.form("register_form", clear_on_submit=True):
-                full_name = st.text_input("Full Name", placeholder="e.g. Kwame Mensah")
-                new_username = st.text_input("Username", placeholder="Lowercase, min 3 chars")
-                new_password = st.text_input("Password", type="password", placeholder="Min 6 characters")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                st.caption("New sign-ups default to `staff`. Admin privileges are assigned only by an administrator.")
-                created = st.form_submit_button("Create Staff Account", use_container_width=True)
-                if created:
-                    if new_password != confirm_password:
-                        st.error("Passwords do not match.")
-                    else:
-                        ok, msg = register_staff_user(new_username, full_name, new_password)
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-
-        with tab_recover:
-            st.markdown("#### Step 1: Request a Reset Token")
-            with st.form("request_token_form", clear_on_submit=False):
-                rec_username = st.text_input("Account Username", placeholder="Enter username to recover")
-                req_token = st.form_submit_button("Generate Recovery Token", use_container_width=True)
-                if req_token:
-                    found, token = issue_password_reset_token(rec_username, ttl_minutes=RECOVERY_TOKEN_TTL_MINUTES)
-                    if found and token:
-                        st.session_state["recovery_token_preview"] = token
-                        unit_label = "minute" if RECOVERY_TOKEN_TTL_MINUTES == 1 else "minutes"
-                        st.success(
-                            f"Recovery token generated (valid for {RECOVERY_TOKEN_TTL_MINUTES} {unit_label}). "
-                            "Copy it below to reset the password:"
-                        )
-                        st.code(token, language="text")
-                    else:
-                        st.info("If an active account matches that username, a recovery token has been logged.")
-
-            st.markdown("#### Step 2: Set a New Password With Token")
-            default_tok = st.session_state.get("recovery_token_preview", "")
-            with st.form("reset_with_token_form", clear_on_submit=True):
-                token_input = st.text_input("Recovery Token", value=default_tok, placeholder="Paste your recovery token")
-                rec_new_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
-                rec_confirm_pw = st.text_input("Confirm New Password", type="password")
-                reset_btn = st.form_submit_button("Reset Password", type="primary", use_container_width=True)
-                if reset_btn:
-                    if rec_new_pw != rec_confirm_pw:
-                        st.error("New passwords do not match.")
-                    else:
-                        ok, msg = reset_password_with_token(token_input, rec_new_pw)
-                        if ok:
-                            st.session_state.pop("recovery_token_preview", None)
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-
-        render_developer_footer()
-
-
-# ==============================================================================
-# 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
-# ==============================================================================
-def render_overview_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
-    st.subheader("Executive KPIs & Alerts")
-
-    total_skus = len(products_df)
-    total_units = safe_int(products_df["stock_qty"].sum()) if not products_df.empty and "stock_qty" in products_df else 0
-    inventory_cost_val = safe_float(products_df["stock_value"].sum()) if not products_df.empty and "stock_value" in products_df else 0.0
-
-    low_stock_df = pd.DataFrame()
-    if not products_df.empty and "status" in products_df:
-        low_stock_df = products_df[products_df["status"].isin(["Low Stock", "Out of Stock"])]
-
-    sales_df = pd.DataFrame()
-    if not tx_df.empty and "tx_type" in tx_df:
-        sales_df = tx_df[tx_df["tx_type"] == "SALE"]
-
-    total_sales_rev = safe_float(sales_df["total_amount"].sum()) if not sales_df.empty and "total_amount" in sales_df else 0.0
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Active SKUs", f"{total_skus:,}")
-    c2.metric("Total Stock Units", f"{total_units:,}")
-    c3.metric("Stock Valuation (Cost)", f"{inventory_cost_val:,.2f}")
-    c4.metric("Recorded Sales Revenue", f"{total_sales_rev:,.2f}")
-    c5.metric("Low / Out of Stock", f"{len(low_stock_df):,}")
-
-    st.divider()
-
-    if not low_stock_df.empty:
-        st.warning("Attention: The following items are at or below their reorder threshold:")
-        cols = [c for c in ["sku", "name", "category", "stock_qty", "reorder_level", "status"] if c in low_stock_df.columns]
-        st.dataframe(low_stock_df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.success("All inventory items are above their reorder thresholds.")
-
-    st.subheader("Recent Transactions")
-    if not tx_df.empty:
-        st.dataframe(tx_df.head(15), use_container_width=True, hide_index=True)
-    else:
-        st.info("No transactions recorded yet.")
-
-
-def render_inventory_tab(products_df: pd.DataFrame, user: dict):
-    st.subheader("Inventory Catalog & Stock Movements")
-
-    col_left, col_right = st.columns([1, 1.4])
-
-    with col_left:
-        st.markdown("#### Record Sale or Restock")
-        if products_df.empty:
-            st.info("Add products first to record stock movements.")
-        else:
-            product_options = {}
-            for _, row in products_df.iterrows():
-                label = f"{row.get('sku', '')} — {row.get('name', '')} (Qty: {safe_int(row.get('stock_qty'))})"
-                product_options[label] = safe_int(row.get("id"))
-
-            with st.form("movement_form", clear_on_submit=True):
-                selected_label = st.selectbox("Product", list(product_options.keys()))
-                tx_type = st.selectbox("Movement Type", ["SALE", "RESTOCK"])
-                qty = st.number_input("Quantity", min_value=1, step=1, value=1)
-                override_price = st.number_input(
-                    "Custom Unit Price (0 = use default price/cost)",
-                    min_value=0.0,
-                    step=0.5,
-                    value=0.0,
-                )
-                notes = st.text_input("Notes / Reference", placeholder="e.g. Receipt #104 or Supplier delivery")
-                submitted = st.form_submit_button("Submit Movement", type="primary", use_container_width=True)
-                if submitted:
-                    prod_id = product_options[selected_label]
-                    price_val = None if override_price <= 0 else float(override_price)
-                    ok, msg = record_stock_movement(
-                        product_id=prod_id,
-                        tx_type=tx_type,
-                        quantity=int(qty),
-                        custom_price=price_val,
-                        notes=notes,
-                        actor=user["username"],
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-        st.markdown("#### Add or Update Product")
-        with st.form("product_form", clear_on_submit=True):
-            sku = st.text_input("SKU", placeholder="e.g. SKU-1005")
-            name = st.text_input("Product Name", placeholder="e.g. Barcode Label Printer")
-            category = st.text_input("Category", value="General")
-            col_c, col_p = st.columns(2)
-            unit_cost = col_c.number_input("Unit Cost", min_value=0.0, step=0.5, value=0.0)
-            selling_price = col_p.number_input("Selling Price", min_value=0.0, step=0.5, value=0.0)
-            col_q, col_r = st.columns(2)
-            stock_qty = col_q.number_input("Stock Quantity", min_value=0, step=1, value=0)
-            reorder_level = col_r.number_input("Reorder Level", min_value=0, step=1, value=10)
-            saved = st.form_submit_button("Save Product", use_container_width=True)
-            if saved:
-                ok, msg = add_or_update_product(
-                    sku=sku,
-                    name=name,
-                    category=category,
-                    unit_cost=float(unit_cost),
-                    selling_price=float(selling_price),
-                    stock_qty=int(stock_qty),
-                    reorder_level=int(reorder_level),
-                    actor=user["username"],
-                )
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-    with col_right:
-        st.markdown("#### Current Stock Table")
-        if products_df.empty:
-            st.info("No products found.")
-        else:
-            search_q = st.text_input("Filter by SKU, Name, or Category", placeholder="Type to filter...")
-            filtered = products_df.copy()
-            if search_q and search_q.strip():
-                q = search_q.strip().lower()
-                mask = pd.Series(False, index=filtered.index)
-                for col in ["sku", "name", "category"]:
-                    if col in filtered.columns:
-                        mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(q, regex=False)
-                filtered = filtered[mask]
-
-            st.dataframe(filtered, use_container_width=True, hide_index=True)
-
-            csv_buf = io.StringIO()
-            filtered.to_csv(csv_buf, index=False)
-            st.download_button(
-                label="Download Filtered Inventory CSV",
-                data=csv_buf.getvalue(),
-                file_name=f"inventory_{date.today().isoformat()}.csv",
-                mime="text/csv",
-            )
-
-            if user.get("role") == "admin":
-                st.markdown("##### Admin: Delete Product")
-                del_map = {
-                    f"{r.get('sku', '')} — {r.get('name', '')}": safe_int(r.get("id"))
-                    for _, r in products_df.iterrows()
-                }
-                if del_map:
-                    del_choice = st.selectbox("Select product to remove", list(del_map.keys()), key="del_prod_select")
-                    if st.button("Delete Selected Product", type="secondary"):
-                        ok, msg = delete_product(
-                            del_map[del_choice],
-                            actor_role=user.get("role", "staff"),
-                            actor=user["username"],
-                        )
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-
-def render_bi_analytics_tab(products_df: pd.DataFrame, tx_df: pd.DataFrame):
-    st.subheader("Business Intelligence & Analytics")
-
-    if not products_df.empty and {"category", "stock_value"}.issubset(products_df.columns):
-        st.markdown("#### Stock Value by Category")
-        agg_cols = [c for c in ["stock_qty", "stock_value", "retail_value"] if c in products_df.columns]
-        cat_summary = (
-            products_df.groupby("category", as_index=False)[agg_cols]
-            .sum()
-            .sort_values("stock_value", ascending=False)
-        )
-        hover_cols = [c for c in ["stock_qty", "retail_value"] if c in cat_summary.columns]
-        fig_cat = px.bar(
-            cat_summary,
-            x="category",
-            y="stock_value",
-            hover_data=hover_cols,
-            title="Inventory Cost Valuation by Category",
-        )
-        st.plotly_chart(fig_cat, use_container_width=True)
-
-    if not tx_df.empty and {"tx_type", "created_at", "total_amount"}.issubset(tx_df.columns):
-        sales_only = tx_df[tx_df["tx_type"] == "SALE"].copy()
-        if not sales_only.empty:
-            sales_only["date"] = pd.to_datetime(sales_only["created_at"], utc=True, errors="coerce").dt.date
-            sales_only = sales_only.dropna(subset=["date"])
-            if not sales_only.empty:
-                daily_sales = sales_only.groupby("date", as_index=False)["total_amount"].sum()
-
-                st.markdown("#### Daily Sales Trend")
-                fig_sales = px.line(
-                    daily_sales,
-                    x="date",
-                    y="total_amount",
-                    markers=True,
-                    title="Daily Revenue From Recorded Sales",
-                )
-                st.plotly_chart(fig_sales, use_container_width=True)
-
-            group_cols = [c for c in ["sku", "product_name"] if c in sales_only.columns]
-            metric_cols = [c for c in ["quantity", "total_amount"] if c in sales_only.columns]
-            if group_cols and metric_cols:
-                st.markdown("#### Top Selling Products by Revenue")
-                top_prods = (
-                    sales_only.groupby(group_cols, as_index=False)[metric_cols]
-                    .sum()
-                    .sort_values("total_amount", ascending=False)
-                    .head(10)
-                )
-                st.dataframe(top_prods, use_container_width=True, hide_index=True)
-        else:
-            st.info("Record SALE movements in the Inventory tab to populate sales charts.")
-    else:
-        st.info("No transaction data available for analytics yet.")
-
-
-def render_bulk_import_tab(user: dict):
-    st.subheader("Bulk CSV Multitask: Product Catalog & Sales Against Stock")
-
-    col_cat, col_sales = st.columns(2)
-
-    with col_cat:
-        st.markdown("#### 1. Bulk CSV Product Catalog Import")
-        st.caption("Columns: `sku`, `name`, `category`, `unit_cost`, `selling_price`, `stock_qty`, `reorder_level`.")
-
-        sample_prod_csv = (
-            "sku,name,category,unit_cost,selling_price,stock_qty,reorder_level\n"
-            "SKU-2001,USB-C Hub 7-Port,Accessories,45.00,75.00,30,10\n"
-            "SKU-2002,A4 Thermal Labels,Supplies,12.00,22.00,50,15\n"
-        )
-        st.download_button(
-            label="Download Sample Product CSV",
-            data=sample_prod_csv,
-            file_name="sample_products_import.csv",
-            mime="text/csv",
-            key="dl_sample_prod_csv",
-        )
-
-        uploaded_prod = st.file_uploader("Choose Product CSV file", type=["csv"], key="upload_prod_csv")
-        if uploaded_prod is not None:
-            try:
-                df_up = pd.read_csv(uploaded_prod)
-                if df_up.empty:
-                    st.warning("Uploaded product CSV is empty.")
-                else:
-                    st.dataframe(df_up.head(20), use_container_width=True, hide_index=True)
-
-                    if st.button("Import Products Into Neon", type="primary", key="btn_import_prod_csv"):
-                        normalized_cols = {str(c).strip().lower() for c in df_up.columns}
-                        if not {"sku", "name"}.issubset(normalized_cols):
-                            st.error("CSV must contain at least 'sku' and 'name' columns.")
-                        else:
-                            df_up.columns = [str(c).strip().lower() for c in df_up.columns]
-                            imported = 0
-                            errors = []
-                            for idx, row in df_up.iterrows():
-                                ok, msg = add_or_update_product(
-                                    sku=str(row.get("sku", "") if pd.notna(row.get("sku")) else ""),
-                                    name=str(row.get("name", "") if pd.notna(row.get("name")) else ""),
-                                    category=str(row.get("category", "General")) if pd.notna(row.get("category")) else "General",
-                                    unit_cost=safe_float(row.get("unit_cost"), 0.0),
-                                    selling_price=safe_float(row.get("selling_price"), 0.0),
-                                    stock_qty=safe_int(row.get("stock_qty"), 0),
-                                    reorder_level=safe_int(row.get("reorder_level"), 10),
-                                    actor=user["username"],
-                                )
-                                if ok:
-                                    imported += 1
-                                else:
-                                    errors.append(f"Row {idx + 1}: {msg}")
-
-                            log_audit(user["username"], "CSV_BULK_IMPORT", f"Imported {imported} rows")
-                            st.success(f"Imported/updated {imported} products.")
-                            if errors:
-                                st.warning("\n".join(errors))
-                            st.rerun()
-            except Exception as exc:
-                st.error(f"Could not read product CSV: {exc}")
-
-    with col_sales:
-        st.markdown("#### 2. Import Sales Against Stock CSV")
-        st.caption("Deducts sold quantities from matching `sku` stock and records `SALE` transactions. Optional: `unit_price`, `notes`.")
-
-        sample_sales_csv = (
-            "sku,quantity,unit_price,notes\n"
-            "SKU-1001,2,260.00,Batch Sale #1\n"
-            "SKU-1002,10,12.00,Batch Sale #2\n"
-        )
-        st.download_button(
-            label="Download Sample Sales Against Stock CSV",
-            data=sample_sales_csv,
-            file_name="sample_sales_against_stock.csv",
-            mime="text/csv",
-            key="dl_sample_sales_csv",
-        )
-
-        uploaded_sales = st.file_uploader("Choose Sales CSV file", type=["csv"], key="upload_sales_csv")
-        if uploaded_sales is not None:
-            try:
-                df_sales = pd.read_csv(uploaded_sales)
-                if df_sales.empty:
-                    st.warning("Uploaded sales CSV is empty.")
-                else:
-                    st.dataframe(df_sales.head(20), use_container_width=True, hide_index=True)
-
-                    if st.button("Process Sales Against Stock", type="primary", key="btn_import_sales_csv"):
-                        processed, errors = process_sales_against_stock_csv(df_sales, actor=user["username"])
-                        if processed > 0:
-                            st.success(f"Recorded {processed} sales against stock.")
-                        if errors:
-                            st.warning("\n".join(errors))
-                        if processed > 0:
-                            st.rerun()
-            except Exception as exc:
-                st.error(f"Could not read sales CSV: {exc}")
-
-
-def render_admin_tab(user: dict):
-    st.subheader("User Management & Audit Trail")
-
-    if user.get("role") != "admin":
-        st.error("Access denied: Administrator privileges are required.")
-        return
-
-    users_df = fetch_all_users()
-    st.markdown("#### Registered Users")
-    if not users_df.empty:
-        st.dataframe(users_df, use_container_width=True, hide_index=True)
-
-        user_map = {
-            f"@{r.get('username', '')} — {r.get('full_name', '')} ({r.get('role', 'staff')})": safe_int(r.get("id"))
-            for _, r in users_df.iterrows()
-        }
-        if user_map:
-            col_role, col_reset = st.columns(2)
-
-            with col_role:
-                st.markdown("##### Role & Account Status")
-                with st.form("manage_user_form"):
-                    target_label = st.selectbox("Select User to Manage", list(user_map.keys()), key="role_target_user")
-                    new_role = st.selectbox("Assign Role", ["staff", "admin"])
-                    new_active = st.checkbox("Active Account", value=True)
-                    apply_btn = st.form_submit_button("Save User Role & Status", type="primary", use_container_width=True)
-                    if apply_btn:
-                        ok, msg = update_user_role_or_status(
-                            user_id=user_map[target_label],
-                            role=new_role,
-                            is_active=new_active,
-                            actor_role=user.get("role", "staff"),
-                            actor=user["username"],
-                        )
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-            with col_reset:
-                st.markdown("##### Reset User Password")
-                with st.form("admin_reset_password_form", clear_on_submit=True):
-                    reset_target_label = st.selectbox("Select User", list(user_map.keys()), key="reset_target_user")
-                    temp_pw = st.text_input("New / Temporary Password", type="password", placeholder="Min 6 characters")
-                    confirm_temp_pw = st.text_input("Confirm Password", type="password")
-                    reset_user_btn = st.form_submit_button("Reset Password", use_container_width=True)
-                    if reset_user_btn:
-                        if temp_pw != confirm_temp_pw:
-                            st.error("Passwords do not match.")
-                        else:
-                            ok, msg = admin_reset_user_password(
-                                target_user_id=user_map[reset_target_label],
-                                new_password=temp_pw,
-                                actor_role=user.get("role", "staff"),
-                                actor=user["username"],
-                            )
-                            if ok:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
-    else:
-        st.info("No users found.")
-
-    st.markdown("#### Recent Audit Logs")
-    logs_df = fetch_audit_logs(limit=100)
-    if not logs_df.empty:
-        st.dataframe(logs_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No audit entries recorded yet.")
-
-
-def render_main_app(user: dict):
-    """Render the main dashboard with role-gated tabs (staff: 2 tabs, admin: 5 tabs)."""
-    is_admin = user.get("role") == "admin"
-
-    with st.sidebar:
-        st.markdown(f"### {user.get('full_name') or user.get('username')}")
-        st.caption(f"@{user.get('username')} • Role: `{user.get('role', 'staff')}`")
-        days_window = st.selectbox("Analytics History Window", [7, 30, 90, 365], index=2)
-
-        with st.expander("Change Password"):
-            with st.form("change_password_form", clear_on_submit=True):
-                curr_pw = st.text_input("Current Password", type="password")
-                next_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
-                confirm_next_pw = st.text_input("Confirm New Password", type="password")
-                chg_btn = st.form_submit_button("Update Password", use_container_width=True)
-                if chg_btn:
-                    if next_pw != confirm_next_pw:
-                        st.error("New passwords do not match.")
-                    else:
-                        ok, msg = change_user_password(user["username"], curr_pw, next_pw)
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-
-        if st.button("Sign Out", use_container_width=True):
-            log_audit(user["username"], "USER_LOGOUT", "Signed out")
-            st.session_state.pop("auth_user", None)
-            st.rerun()
-
-        st.divider()
-        st.caption(
-            f"**{DEVELOPER_COMPANY}**\n\n"
-            f"`{DEVELOPER_EMAIL}`\n\n"
-            f"© {_copyright_span()} {DEVELOPER_COMPANY}"
-        )
-
-    st.title("Enterprise AI Inventory & BI Command Centre")
-    maybe_show_daily_welcome(user)
-
-    products_df = fetch_products()
-    tx_df = fetch_transactions(days=int(days_window))
-
-    tab_labels = ["Overview & KPIs", "Inventory & Sales"]
-    if is_admin:
-        tab_labels.extend(["BI Analytics", "CSV Import", "Users & Audit Log"])
-
-    tabs = st.tabs(tab_labels)
-
-    with tabs[0]:
-        render_overview_tab(products_df, tx_df)
-
-    with tabs[1]:
-        render_inventory_tab(products_df, user)
-
-    if is_admin:
-        with tabs[2]:
-            render_bi_analytics_tab(products_df, tx_df)
-
-        with tabs[3]:
-            render_bulk_import_tab(user)
-
-        with tabs[4]:
-            render_admin_tab(user)
-
-    render_developer_footer()
-
-# ==============================================================================
-# 9. ENTRY POINT
-# ==============================================================================
-def main():
-    try:
-        init_database_schema()
-    except Exception as exc:
-        st.error("Database connection or schema initialization failed.")
-        st.exception(exc)
-        if st.button("Retry Database Connection"):
-            init_database_schema.clear()
-            st.rerun()
-        st.stop()
-
-    auth_user = st.session_state.get("auth_user")
-    if not isinstance(auth_user, dict) or not auth_user.get("username"):
-        st.session_state.pop("auth_user", None)
-        render_auth_screen()
-    else:
-        render_main_app(auth_user)
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-        
+  st.download_button(
+      label="📥 Download Cleaned & Formatted Data (CSV)",
+      data=work_df.to_csv(index=False).encode("utf-8"),
+      file_name=f"cleaned_{str(lab_file.name).rsplit('.', 1)[0]}.csv",
+      mime="text/csv",
+      key="lab_download_cleaned",
+  )
