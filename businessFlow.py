@@ -1,29 +1,20 @@
 from datetime import datetime, timedelta
 import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
 import urllib.parse
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-try:
-  import psycopg2
-  from psycopg2.extras import RealDictCursor
-
-  PSYCOPG2_AVAILABLE = True
-except ImportError:
-  PSYCOPG2_AVAILABLE = False
-
 # ---------------------------------------------------------
-# DEVELOPER & PAGE CONFIGURATION
+# PAGE CONFIGURATION
 # ---------------------------------------------------------
-DEVELOPER_ORG = "Rogers Enterprise Limited | Ghana"
-DEVELOPER_EMAIL = "koffieroggers@gmail.com"
-LOCAL_AUTH_DB = "rogers_bi_auth.db"
-
 st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
     page_icon="🌍",
@@ -31,254 +22,424 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+AUTH_DB_PATH = os.environ.get("ENTERPRISE_AUTH_DB", "enterprise_auth.db")
+MAX_LOGIN_ATTEMPTS = 5
+
 
 # ---------------------------------------------------------
-# NEON POSTGRES + SAFE LOCAL FALLBACK LAYER
+# AUTHENTICATION & SECURITY HELPERS (PBKDF2 + SQLITE)
 # ---------------------------------------------------------
-def get_neon_url() -> str:
-  try:
-    if "neon" in st.secrets and st.secrets["neon"].get("database_url"):
-      return str(st.secrets["neon"]["database_url"]).strip()
-  except Exception:
-    pass
-  try:
-    if st.secrets.get("DATABASE_URL"):
-      return str(st.secrets["DATABASE_URL"]).strip()
-  except Exception:
-    pass
-  for env_key in ("NEON_DATABASE_URL", "DATABASE_URL"):
-    val = os.getenv(env_key, "").strip()
-    if val:
-      return val
-  return ""
+def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+  """Hash a password using PBKDF2-HMAC-SHA256 and a random salt."""
+  salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+  digest = hashlib.pbkdf2_hmac(
+      "sha256",
+      password.encode("utf-8"),
+      salt,
+      200_000,
+  )
+  return salt.hex(), digest.hex()
 
 
-def using_neon() -> bool:
-  return bool(get_neon_url()) and PSYCOPG2_AVAILABLE
+def verify_password(password: str, salt_hex: str, expected_hash_hex: str) -> bool:
+  """Verify a password in constant time."""
+  if not password or not salt_hex or not expected_hash_hex:
+    return False
+  _, actual_hash_hex = hash_password(password, salt_hex)
+  return hmac.compare_digest(actual_hash_hex, expected_hash_hex)
 
 
-def get_local_sqlite_conn():
-  conn = sqlite3.connect(LOCAL_AUTH_DB, check_same_thread=False)
-  conn.row_factory = sqlite3.Row
+def validate_password_strength(password: str) -> list[str]:
+  """Return a list of unmet password rules for clear user guidance."""
+  issues = []
+  if len(password) < 8:
+    issues.append("At least 8 characters long")
+  if not any(ch.isupper() for ch in password):
+    issues.append("At least one uppercase letter (A-Z)")
+  if not any(ch.islower() for ch in password):
+    issues.append("At least one lowercase letter (a-z)")
+  if not any(ch.isdigit() for ch in password):
+    issues.append("At least one number (0-9)")
+  return issues
+
+
+def init_auth_db() -> sqlite3.Connection:
+  """Initialize SQLite auth store and seed a default demo user if empty."""
+  conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS users (
+          username TEXT PRIMARY KEY,
+          full_name TEXT NOT NULL,
+          email TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'Analyst',
+          salt_hex TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          reset_token TEXT,
+          reset_expires_at TEXT,
+          failed_attempts INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+      )
+      """)
+  cur = conn.execute("SELECT COUNT(*) FROM users")
+  count = cur.fetchone()[0]
+  if count == 0:
+    salt_h, pwd_h = hash_password("RogersBI#2026")
+    now_iso = datetime.utcnow().isoformat()
+    conn.execute(
+        """
+        INSERT INTO users (
+            username, full_name, email, role, salt_hex, password_hash,
+            reset_token, reset_expires_at, failed_attempts, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+        """,
+        (
+            "admin",
+            "Rogers Lead Administrator",
+            "admin@rogersenterprises.local",
+            "Admin",
+            salt_h,
+            pwd_h,
+            now_iso,
+        ),
+    )
+    conn.commit()
   return conn
 
 
-def init_auth_and_audit_storage():
-  if using_neon():
-    conn = psycopg2.connect(get_neon_url(), sslmode="require")
-    try:
-      with conn.cursor() as cur:
-        cur.execute("""
-                    CREATE TABLE IF NOT EXISTS app_users (
-                        id SERIAL PRIMARY KEY,
-                        full_name VARCHAR(150) NOT NULL,
-                        email VARCHAR(180) UNIQUE NOT NULL,
-                        organization VARCHAR(180) DEFAULT 'Rogers Enterprise Limited | Ghana',
-                        password_hash TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_login TIMESTAMP
-                    );
-                """)
-        cur.execute("""
-                    CREATE TABLE IF NOT EXISTS clean_audit_logs (
-                        id SERIAL PRIMARY KEY,
-                        user_email VARCHAR(180) NOT NULL,
-                        file_name VARCHAR(255),
-                        overview_summary TEXT,
-                        conclusion_text TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-      conn.commit()
-    finally:
-      conn.close()
-  else:
-    conn = get_local_sqlite_conn()
-    try:
-      conn.execute("""
-                CREATE TABLE IF NOT EXISTS app_users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    full_name TEXT NOT NULL,
-                    email TEXT UNIQUE NOT NULL,
-                    organization TEXT DEFAULT 'Rogers Enterprise Limited | Ghana',
-                    password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    last_login TEXT
-                )
-            """)
-      conn.execute("""
-                CREATE TABLE IF NOT EXISTS clean_audit_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_email TEXT NOT NULL,
-                    file_name TEXT,
-                    overview_summary TEXT,
-                    conclusion_text TEXT,
-                    created_at TEXT NOT NULL
-                )
-            """)
-      conn.commit()
-    finally:
-      conn.close()
+def get_user(conn: sqlite3.Connection, identifier: str) -> dict | None:
+  """Fetch user by username or email (case-insensitive)."""
+  clean_id = (identifier or "").strip().lower()
+  if not clean_id:
+    return None
+  row = conn.execute(
+      """
+      SELECT username, full_name, email, role, salt_hex, password_hash,
+             reset_token, reset_expires_at, failed_attempts, created_at
+      FROM users
+      WHERE LOWER(username) = ? OR LOWER(email) = ?
+      """,
+      (clean_id, clean_id),
+  ).fetchone()
+  if not row:
+    return None
+  return {
+      "username": row[0],
+      "full_name": row[1],
+      "email": row[2],
+      "role": row[3],
+      "salt_hex": row[4],
+      "password_hash": row[5],
+      "reset_token": row[6],
+      "reset_expires_at": row[7],
+      "failed_attempts": int(row[8] or 0),
+      "created_at": row[9],
+  }
 
 
-def hash_password(password: str, salt: str = None) -> str:
-  if salt is None:
-    salt = os.urandom(16).hex()
-  dk = hashlib.pbkdf2_hmac(
-      "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
+def register_user(
+    conn: sqlite3.Connection,
+    username: str,
+    full_name: str,
+    email: str,
+    role: str,
+    password: str,
+) -> tuple[bool, str]:
+  """Register a new user account."""
+  u = username.strip()
+  fn = full_name.strip()
+  em = email.strip()
+  if len(u) < 3 or not u.replace("_", "").replace(".", "").isalnum():
+    return False, "Username must be at least 3 characters (letters, numbers, _, .)."
+  if not fn:
+    return False, "Please enter your full name."
+  if "@" not in em or "." not in em.split("@")[-1]:
+    return False, "Please enter a valid email address."
+  strength_issues = validate_password_strength(password)
+  if strength_issues:
+    return False, "Password requirements not met: " + ", ".join(strength_issues) + "."
+  if get_user(conn, u) or get_user(conn, em):
+    return False, "An account with that username or email already exists."
+
+  salt_h, pwd_h = hash_password(password)
+  conn.execute(
+      """
+      INSERT INTO users (
+          username, full_name, email, role, salt_hex, password_hash,
+          reset_token, reset_expires_at, failed_attempts, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+      """,
+      (
+          u,
+          fn,
+          em,
+          role,
+          salt_h,
+          pwd_h,
+          datetime.utcnow().isoformat(),
+      ),
   )
-  return f"{salt}${dk.hex()}"
+  conn.commit()
+  return True, f"Account created for '{u}' ({role}). You can now log in."
 
 
-def verify_password(password: str, stored_hash: str) -> bool:
-  if not stored_hash or "$" not in stored_hash:
-    return False
-  salt, expected_hex = stored_hash.split("$", 1)
-  dk = hashlib.pbkdf2_hmac(
-      "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
+def authenticate_user(
+    conn: sqlite3.Connection, identifier: str, password: str
+) -> tuple[bool, str, dict | None]:
+  """Authenticate user credentials with attempt tracking."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "No account found matching that username or email.", None
+
+  if user["failed_attempts"] >= MAX_LOGIN_ATTEMPTS:
+    return (
+        False,
+        f"Account locked after {MAX_LOGIN_ATTEMPTS} failed attempts. Use 'Forgot / Reset Password' below to recover access.",
+        None,
+    )
+
+  if verify_password(password, user["salt_hex"], user["password_hash"]):
+    conn.execute(
+        "UPDATE users SET failed_attempts = 0 WHERE username = ?",
+        (user["username"],),
+    )
+    conn.commit()
+    return True, f"Welcome back, {user['full_name']}!", user
+
+  new_attempts = user["failed_attempts"] + 1
+  conn.execute(
+      "UPDATE users SET failed_attempts = ? WHERE username = ?",
+      (new_attempts, user["username"]),
   )
-  return dk.hex() == expected_hex
+  conn.commit()
+  remaining = max(0, MAX_LOGIN_ATTEMPTS - new_attempts)
+  return (
+      False,
+      f"Incorrect password. {remaining} attempt(s) remaining before temporary lock.",
+      None,
+  )
 
 
-def register_user(full_name: str, email: str, password: str, org: str):
-  norm_email = email.strip().lower()
-  pw_hash = hash_password(password)
-  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-  if using_neon():
-    conn = psycopg2.connect(get_neon_url(), sslmode="require")
-    try:
-      with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM app_users WHERE LOWER(email) = %s", (norm_email,)
-        )
-        if cur.fetchone():
-          return False, "An account with this email already exists in Neon."
-        cur.execute(
-            """
-                        INSERT INTO app_users (full_name, email, organization, password_hash, last_login)
-                        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    """,
-            (
-                full_name.strip(),
-                norm_email,
-                org.strip() or DEVELOPER_ORG,
-                pw_hash,
-            ),
-        )
-      conn.commit()
-      return True, "Account created in Neon Postgres. You are now signed in."
-    finally:
-      conn.close()
-  else:
-    conn = get_local_sqlite_conn()
-    try:
-      existing = conn.execute(
-          "SELECT id FROM app_users WHERE LOWER(email) = ?", (norm_email,)
-      ).fetchone()
-      if existing:
-        return False, "An account with this email already exists."
-      conn.execute(
-          """
-                INSERT INTO app_users (full_name, email, organization, password_hash, created_at, last_login)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """,
-          (
-              full_name.strip(),
-              norm_email,
-              org.strip() or DEVELOPER_ORG,
-              pw_hash,
-              now_str,
-              now_str,
-          ),
+def issue_recovery_token(
+    conn: sqlite3.Connection, identifier: str
+) -> tuple[bool, str, str | None]:
+  """Generate a 15-minute password reset token for an existing user."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "No account found for that username or email.", None
+  token = secrets.token_urlsafe(8)
+  expires_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+  conn.execute(
+      """
+      UPDATE users
+      SET reset_token = ?, reset_expires_at = ?
+      WHERE username = ?
+      """,
+      (token, expires_at, user["username"]),
+  )
+  conn.commit()
+  return (
+      True,
+      f"Recovery token generated for @{user['username']} (valid for 15 minutes).",
+      token,
+  )
+
+
+def reset_password_with_token(
+    conn: sqlite3.Connection,
+    identifier: str,
+    token: str,
+    new_password: str,
+) -> tuple[bool, str]:
+  """Validate recovery token and update user password."""
+  user = get_user(conn, identifier)
+  if not user:
+    return False, "Account not found."
+  if not user["reset_token"] or not user["reset_expires_at"]:
+    return False, "No active recovery token found. Request a new token first."
+  if datetime.utcnow() > datetime.fromisoformat(user["reset_expires_at"]):
+    return False, "Recovery token has expired. Request a new token."
+  if not hmac.compare_digest(token.strip(), user["reset_token"].strip()):
+    return False, "Invalid recovery token."
+
+  issues = validate_password_strength(new_password)
+  if issues:
+    return False, "New password does not meet rules: " + ", ".join(issues) + "."
+
+  salt_h, pwd_h = hash_password(new_password)
+  conn.execute(
+      """
+      UPDATE users
+      SET salt_hex = ?, password_hash = ?, reset_token = NULL,
+          reset_expires_at = NULL, failed_attempts = 0
+      WHERE username = ?
+      """,
+      (salt_h, pwd_h, user["username"]),
+  )
+  conn.commit()
+  return True, "Password reset successful. You may now log in with your new password."
+
+
+def render_auth_gate(conn: sqlite3.Connection) -> bool:
+  """Render Sign In, Sign Up, and Password Recovery UI with explicit prompts."""
+  if st.session_state.get("auth_user"):
+    return True
+
+  st.title("🔐 Enterprise Access & Account Portal")
+  st.caption(
+      "Rogers Enterprises Limited | Secure Sign-In, Account Registration & Password Recovery"
+  )
+
+  st.info(
+      "**What to do here:**\n"
+      "- **Existing Users (Login):** Enter your *Username or Email* and *Password*. "
+      "Demo admin credentials: `admin` / `RogersBI#2026`.\n"
+      "- **New Users (Sign Up):** Switch to **Create Account**, choose your workspace role "
+      "(*Analyst* for analytics & reporting, *Admin* for full operational controls), and set a strong password.\n"
+      "- **Forgot Password (Recovery):** Switch to **Recover Password** to generate a 15-minute reset token and set a new password."
+  )
+
+  tab_login, tab_signup, tab_reset = st.tabs(
+      ["🔑 Login", "📝 Create Account (Sign Up)", "♻️ Recover / Reset Password"]
+  )
+
+  with tab_login:
+    st.subheader("Sign In to Your Workspace")
+    st.markdown(
+        "**Required right now:** Provide your registered **Username or Email** and **Password**, then click **Sign In**."
+    )
+    with st.form("login_form"):
+      login_id = st.text_input(
+          "Username or Email",
+          placeholder="e.g., admin or analyst@company.com",
       )
-      conn.commit()
-      return (
-          True,
-          "Account created (local fallback active). You are now signed in.",
+      login_pwd = st.text_input(
+          "Password",
+          type="password",
+          placeholder="Enter your password",
       )
-    finally:
-      conn.close()
+      submitted_login = st.form_submit_button("🔓 Sign In", use_container_width=True)
 
+    if submitted_login:
+      if not login_id.strip() or not login_pwd:
+        st.warning("Please enter both your Username/Email and Password before signing in.")
+      else:
+        ok, msg, user_rec = authenticate_user(conn, login_id, login_pwd)
+        if ok and user_rec:
+          st.session_state["auth_user"] = user_rec
+          st.success(msg)
+          st.rerun()
+        else:
+          st.error(msg)
 
-def authenticate_user(email: str, password: str):
-  norm_email = email.strip().lower()
-  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-  if using_neon():
-    conn = psycopg2.connect(get_neon_url(), sslmode="require")
-    try:
-      with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            "SELECT * FROM app_users WHERE LOWER(email) = %s", (norm_email,)
+  with tab_signup:
+    st.subheader("Register a New Enterprise Account")
+    st.markdown(
+        "**Required right now:** Fill in all fields below. Your password must have **8+ characters**, "
+        "**1 uppercase letter**, **1 lowercase letter**, and **1 digit**."
+    )
+    with st.form("signup_form"):
+      s_col1, s_col2 = st.columns(2)
+      new_fullname = s_col1.text_input(
+          "Full Name", placeholder="e.g., Kwame Mensah"
+      )
+      new_username = s_col2.text_input(
+          "Choose Username", placeholder="e.g., kwame_bi"
+      )
+      s_col3, s_col4 = st.columns(2)
+      new_email = s_col3.text_input(
+          "Work Email", placeholder="e.g., kwame@rogersenterprises.com"
+      )
+      new_role = s_col4.selectbox(
+          "Select Access Role",
+          ["Analyst", "Inventory Planner", "Admin"],
+          help="Analyst & Inventory Planner can run BI & forecasting; Admin manages full operational workflows.",
+      )
+      p_col1, p_col2 = st.columns(2)
+      new_pwd = p_col1.text_input(
+          "Create Password", type="password", placeholder="Min 8 chars, Aa1"
+      )
+      confirm_pwd = p_col2.text_input(
+          "Confirm Password", type="password", placeholder="Re-enter password"
+      )
+      submitted_signup = st.form_submit_button(
+          "✅ Create Account", use_container_width=True
+      )
+
+    if submitted_signup:
+      if new_pwd != confirm_pwd:
+        st.error("Passwords do not match. Please re-enter both password fields.")
+      else:
+        ok, msg = register_user(
+            conn, new_username, new_fullname, new_email, new_role, new_pwd
         )
-        user = cur.fetchone()
-        if user and verify_password(password, user["password_hash"]):
-          cur.execute(
-              "UPDATE app_users SET last_login = CURRENT_TIMESTAMP WHERE id = %s",
-              (user["id"],),
-          )
-          conn.commit()
-          return True, dict(user)
-      return False, None
-    finally:
-      conn.close()
-  else:
-    conn = get_local_sqlite_conn()
-    try:
-      row = conn.execute(
-          "SELECT * FROM app_users WHERE LOWER(email) = ?", (norm_email,)
-      ).fetchone()
-      if row and verify_password(password, row["password_hash"]):
-        conn.execute(
-            "UPDATE app_users SET last_login = ? WHERE id = ?",
-            (now_str, row["id"]),
-        )
-        conn.commit()
-        return True, dict(row)
-      return False, None
-    finally:
-      conn.close()
+        if ok:
+          st.success(msg)
+        else:
+          st.error(msg)
 
+  with tab_reset:
+    st.subheader("Password Recovery & Reset")
+    st.markdown(
+        "**Step 1:** Enter your **Username or Email** and click **Generate Recovery Token**.\n"
+        "**Step 2:** Copy the token shown and enter your **New Password** below, then click **Reset Password**."
+    )
+    with st.form("request_token_form"):
+      rec_id = st.text_input(
+          "Account Username or Email",
+          placeholder="Enter username or email to recover",
+      )
+      req_token_btn = st.form_submit_button("🎟️ Generate Recovery Token")
 
-def record_clean_audit(
-    user_email: str, file_name: str, overview_text: str, conclusion_text: str
-):
-  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-  try:
-    if using_neon():
-      conn = psycopg2.connect(get_neon_url(), sslmode="require")
-      try:
-        with conn.cursor() as cur:
-          cur.execute(
-              """
-                            INSERT INTO clean_audit_logs (user_email, file_name, overview_summary, conclusion_text)
-                            VALUES (%s, %s, %s, %s)
-                        """,
-              (user_email, file_name, overview_text, conclusion_text),
-          )
-        conn.commit()
-      finally:
-        conn.close()
-    else:
-      conn = get_local_sqlite_conn()
-      try:
-        conn.execute(
-            """
-                    INSERT INTO clean_audit_logs (user_email, file_name, overview_summary, conclusion_text, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-            (user_email, file_name, overview_text, conclusion_text, now_str),
+    if req_token_btn:
+      ok, msg, token_val = issue_recovery_token(conn, rec_id)
+      if ok and token_val:
+        st.session_state["last_issued_token"] = token_val
+        st.session_state["last_recovery_id"] = rec_id.strip()
+        st.success(msg)
+        st.code(token_val, language="text")
+      else:
+        st.error(msg)
+
+    st.markdown("---")
+    with st.form("apply_reset_form"):
+      r_col1, r_col2 = st.columns(2)
+      reset_id = r_col1.text_input(
+          "Confirm Username or Email",
+          value=st.session_state.get("last_recovery_id", ""),
+      )
+      reset_token = r_col2.text_input(
+          "Recovery Token",
+          value=st.session_state.get("last_issued_token", ""),
+          placeholder="Paste 15-minute recovery token",
+      )
+      r_col3, r_col4 = st.columns(2)
+      reset_new_pwd = r_col3.text_input("New Password", type="password")
+      reset_confirm_pwd = r_col4.text_input("Confirm New Password", type="password")
+      apply_reset_btn = st.form_submit_button(
+          "🔁 Reset Password", use_container_width=True
+      )
+
+    if apply_reset_btn:
+      if reset_new_pwd != reset_confirm_pwd:
+        st.error("New password and confirmation do not match.")
+      else:
+        ok, msg = reset_password_with_token(
+            conn, reset_id, reset_token, reset_new_pwd
         )
-        conn.commit()
-      finally:
-        conn.close()
-  except Exception:
-    pass
+        if ok:
+          st.session_state.pop("last_issued_token", None)
+          st.success(msg)
+        else:
+          st.error(msg)
+
+  return False
 
 
 # ---------------------------------------------------------
-# SHARED SAFE DATA HELPERS
+# SHARED SAFE DATA & ANALYTICS HELPERS
 # ---------------------------------------------------------
 def clean_text_cell(v):
+  """Normalize text cells and map null-like strings to np.nan."""
   if v is None:
     return np.nan
   try:
@@ -295,6 +456,7 @@ def clean_text_cell(v):
 
 
 def clean_numeric_series(s: pd.Series) -> pd.Series:
+  """Safely convert currency/comma strings and numbers into float64."""
   if s is None or len(s) == 0:
     return pd.Series([], dtype="float64")
   if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
@@ -313,7 +475,8 @@ def clean_numeric_series(s: pd.Series) -> pd.Series:
   return out
 
 
-def find_col_case_insensitive(df: pd.DataFrame, target: str):
+def find_col_case_insensitive(df: pd.DataFrame, target: str) -> str | None:
+  """Find a DataFrame column matching target ignoring case and outer spaces."""
   target_low = target.strip().lower()
   for col in df.columns:
     if str(col).strip().lower() == target_low:
@@ -321,7 +484,8 @@ def find_col_case_insensitive(df: pd.DataFrame, target: str):
   return None
 
 
-def load_any_tabular_file(uploaded_file, key_prefix="lab"):
+def load_any_tabular_file(uploaded_file, key_prefix: str = "lab") -> pd.DataFrame:
+  """Load CSV or Excel workbook safely with encoding fallback."""
   name = str(uploaded_file.name).lower()
   if name.endswith(".csv"):
     for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
@@ -332,489 +496,42 @@ def load_any_tabular_file(uploaded_file, key_prefix="lab"):
         continue
     uploaded_file.seek(0)
     return pd.read_csv(uploaded_file, sep=None, engine="python")
-  else:
-    uploaded_file.seek(0)
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_name = st.selectbox(
-        "Select Excel Sheet", xls.sheet_names, key=f"{key_prefix}_excel_sheet"
-    )
-    uploaded_file.seek(0)
-    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
-
-
-def snapshot_metrics(df: pd.DataFrame) -> dict:
-  rows_cnt = int(len(df))
-  cols_cnt = int(len(df.columns))
-  missing_cnt = int(df.isna().sum().sum()) if rows_cnt > 0 else 0
-  try:
-    dup_cnt = int(df.duplicated().sum()) if rows_cnt > 0 else 0
-  except Exception:
-    dup_cnt = 0
-
-  numeric_ready_cols = 0
-  for c in df.columns:
-    num_s = clean_numeric_series(df[c])
-    non_blank = df[c].apply(clean_text_cell).notna().sum()
-    if non_blank > 0 and (num_s.notna().sum() / non_blank) >= 0.7:
-      numeric_ready_cols += 1
-
-  return {
-      "rows": rows_cnt,
-      "cols": cols_cnt,
-      "missing_cells": missing_cnt,
-      "duplicates": dup_cnt,
-      "numeric_ready_cols": numeric_ready_cols,
-  }
-
-
-# ---------------------------------------------------------
-# INITIALIZE STORAGE & AUTH GATE
-# ---------------------------------------------------------
-init_auth_and_audit_storage()
-
-if "auth_user" not in st.session_state:
-  st.session_state.auth_user = None
-
-if st.session_state.auth_user is None:
-  st.title("🔐 Sign In / Sign Up — Enterprise BI Command Centre")
-  st.markdown(
-      f"**{DEVELOPER_ORG}** • Contact: `{DEVELOPER_EMAIL}`  \n"
-      "Please **Sign In** or **Sign Up** to access supply chain analytics,"
-      " universal CSV/Excel cleaning, regression, and AI future diagnosis."
+  uploaded_file.seek(0)
+  xls = pd.ExcelFile(uploaded_file)
+  sheet_name = st.selectbox(
+      "Select Excel Sheet", xls.sheet_names, key=f"{key_prefix}_excel_sheet"
   )
-  db_badge = (
-      "🟢 Connected to **Neon Postgres** (`sslmode=require`)"
-      if using_neon()
-      else (
-          "🟡 Local SQLite Fallback Active (add `[neon] database_url` in"
-          " `.streamlit/secrets.toml` to connect Neon)"
-      )
-  )
-  st.info(db_badge)
-
-  tab_login, tab_signup = st.tabs(["🔑 Sign In", "📝 Sign Up (Create Account)"])
-
-  with tab_login:
-    with st.form("login_form"):
-      login_email = st.text_input("Email Address")
-      login_pw = st.text_input("Password", type="password")
-      submitted_login = st.form_submit_button("Sign In")
-      if submitted_login:
-        if not login_email.strip() or not login_pw:
-          st.warning("Please enter both your email address and password.")
-        else:
-          try:
-            ok, user_data = authenticate_user(login_email, login_pw)
-            if ok and user_data:
-              st.session_state.auth_user = user_data
-              st.success(f"Welcome back, {user_data['full_name']}!")
-              st.rerun()
-            else:
-              st.error("Invalid email or password.")
-          except Exception as exc:
-            st.error(f"Sign-in error: {exc}")
-
-  with tab_signup:
-    with st.form("signup_form"):
-      reg_name = st.text_input("Full Name")
-      reg_email = st.text_input("Email Address")
-      reg_org = st.text_input("Business / Organization", value=DEVELOPER_ORG)
-      reg_pw = st.text_input("Create Password (min. 6 characters)", type="password")
-      reg_pw2 = st.text_input("Confirm Password", type="password")
-      submitted_reg = st.form_submit_button("Create Account & Sign In")
-      if submitted_reg:
-        if not reg_name.strip() or not reg_email.strip() or len(reg_pw) < 6:
-          st.warning(
-              "Please enter your full name, a valid email, and a password of at"
-              " least 6 characters."
-          )
-        elif reg_pw != reg_pw2:
-          st.error("Passwords do not match.")
-        else:
-          try:
-            ok, msg = register_user(reg_name, reg_email, reg_pw, reg_org)
-            if ok:
-              _, user_data = authenticate_user(reg_email, reg_pw)
-              st.session_state.auth_user = user_data
-              st.success(msg)
-              st.rerun()
-            else:
-              st.error(msg)
-          except Exception as exc:
-            st.error(f"Sign-up error: {exc}")
-
-  st.stop()
+  uploaded_file.seek(0)
+  return pd.read_excel(uploaded_file, sheet_name=sheet_name)
 
 
-# ---------------------------------------------------------
-# AUTHENTICATED WORKSPACE HEADER & SIDEBAR
-# ---------------------------------------------------------
-active_user = st.session_state.auth_user
+def compute_exponential_forecast(
+    series: pd.Series, steps: int = 7, alpha: float = 0.45, beta: float = 0.25
+) -> np.ndarray:
+  """Holt's linear trend exponential smoothing for modern short-horizon forecasting."""
+  vals = series.dropna().astype(float).values
+  if len(vals) == 0:
+    return np.zeros(steps, dtype=float)
+  if len(vals) == 1:
+    return np.full(steps, max(0.0, float(vals[0])), dtype=float)
 
-with st.sidebar:
-  st.success(
-      f"👤 **{active_user['full_name']}**  \n`{active_user['email']}`  \n"
-      + (
-          "🟢 Neon Postgres Synced"
-          if using_neon()
-          else "🟡 Local Auth Fallback"
-      )
-  )
-  if st.button("🚪 Sign Out", use_container_width=True):
-    st.session_state.auth_user = None
-    st.rerun()
+  level = float(vals[0])
+  trend = float(vals[1] - vals[0])
+  for y in vals[1:]:
+    prev_level = level
+    level = alpha * float(y) + (1.0 - alpha) * (level + trend)
+    trend = beta * (level - prev_level) + (1.0 - beta) * trend
 
-st.title("🌍 Enterprise-Grade Supply Chain & BI Intelligence Suite")
-st.markdown(
-    "Inspired by **Amazon, Jumia, and Alibaba** operational architectures —"
-    " Featuring ABC Pareto Classification, Safety Stock Buffers, SKU Tiering,"
-    " Universal CSV/Excel Multitask Analysis, and AI Future Diagnosis.  \n"
-    f"Empowered by **{DEVELOPER_ORG}** • `{DEVELOPER_EMAIL}`."
-)
-
-# ---------------------------------------------------------
-# SIDEBAR DATA INPUTS & SETTINGS
-# ---------------------------------------------------------
-st.sidebar.header("📁 Enterprise Data Inputs")
-sales_file = st.sidebar.file_uploader(
-    "Upload Sales CSV (Columns: Date, ItemName, QuantitySold, UnitPrice)",
-    type=["csv"],
-)
-stock_file = st.sidebar.file_uploader(
-    "Upload Current Stock CSV (Columns: ItemName, CurrentStock, CostPrice,"
-    " SellingPrice, SupplierPhone)",
-    type=["csv"],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Supply Chain Parameters")
-supplier_lead_time = st.sidebar.slider("Supplier Lead Time (Days)", 1, 30, 7)
-service_level_factor = st.sidebar.selectbox(
-    "Service Level Safety Buffer", [1.28, 1.65, 2.05], index=1
-)
-sales_growth_slider = st.sidebar.slider(
-    "Demand Volatility / Growth Simulation (%)", -50, 100, 0, step=5
-)
-
-if sales_file and stock_file:
-  try:
-    df_sales = pd.read_csv(sales_file)
-    df_stock = pd.read_csv(stock_file)
-
-    item_col_sales = find_col_case_insensitive(df_sales, "ItemName")
-    qty_col_sales = find_col_case_insensitive(df_sales, "QuantitySold")
-    price_col_sales = find_col_case_insensitive(df_sales, "UnitPrice")
-
-    item_col_stock = find_col_case_insensitive(df_stock, "ItemName")
-    curr_stock_col = find_col_case_insensitive(df_stock, "CurrentStock")
-    cost_price_col = find_col_case_insensitive(df_stock, "CostPrice")
-    sell_price_col = find_col_case_insensitive(df_stock, "SellingPrice")
-    phone_col_stock = find_col_case_insensitive(df_stock, "SupplierPhone")
-
-    if not all([item_col_sales, qty_col_sales, price_col_sales]):
-      st.error(
-          "Sales CSV must include ItemName, QuantitySold, and UnitPrice columns."
-      )
-    elif not all([item_col_stock, curr_stock_col, cost_price_col]):
-      st.error(
-          "Stock CSV must include ItemName, CurrentStock, and CostPrice"
-          " columns."
-      )
-    else:
-      df_sales = df_sales.copy()
-      df_stock = df_stock.copy()
-      df_sales["_item"] = df_sales[item_col_sales].apply(clean_text_cell)
-      df_sales["_qty"] = clean_numeric_series(df_sales[qty_col_sales]).fillna(0.0)
-      df_sales["_price"] = clean_numeric_series(
-          df_sales[price_col_sales]
-      ).fillna(0.0)
-      df_sales["TotalRevenue"] = df_sales["_qty"] * df_sales["_price"]
-
-      item_sales = (
-          df_sales.dropna(subset=["_item"])
-          .groupby("_item", as_index=False)
-          .agg(QuantitySold=("_qty", "sum"), TotalRevenue=("TotalRevenue", "sum"))
-          .rename(columns={"_item": "ItemName"})
-      )
-
-      df_stock["ItemName"] = df_stock[item_col_stock].apply(clean_text_cell)
-      df_stock["CurrentStock"] = clean_numeric_series(
-          df_stock[curr_stock_col]
-      ).fillna(0.0)
-      df_stock["CostPrice"] = clean_numeric_series(
-          df_stock[cost_price_col]
-      ).fillna(0.0)
-      if sell_price_col:
-        df_stock["SellingPrice"] = clean_numeric_series(
-            df_stock[sell_price_col]
-        ).fillna(df_stock["CostPrice"] * 1.3)
-      else:
-        df_stock["SellingPrice"] = df_stock["CostPrice"] * 1.3
-      if phone_col_stock:
-        df_stock["SupplierPhone"] = df_stock[phone_col_stock].apply(
-            clean_text_cell
-        )
-
-      df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
-      df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0.0)
-      df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0.0)
-
-      df_analysis["TotalPotentialRevenue"] = (
-          df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
-      )
-      df_analysis["CapitalTiedUp"] = (
-          df_analysis["CurrentStock"] * df_analysis["CostPrice"]
-      )
-      df_analysis["PotentialProfit"] = (
-          df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
-      )
-
-      days_analyzed = 30.0
-      base_velocity = df_analysis["QuantitySold"] / days_analyzed
-      df_analysis["SimulatedVelocity"] = base_velocity * (
-          1.0 + (sales_growth_slider / 100.0)
-      )
-
-      df_analysis["SafetyStock"] = (
-          df_analysis["SimulatedVelocity"]
-          * 0.2
-          * supplier_lead_time
-          * float(service_level_factor)
-      ).apply(lambda x: max(1, int(round(x))) if pd.notna(x) else 1)
-
-      df_analysis["ReorderPoint"] = (
-          df_analysis["SimulatedVelocity"] * supplier_lead_time
-          + df_analysis["SafetyStock"]
-      ).apply(lambda x: int(round(x)) if pd.notna(x) else 0)
-
-      df_analysis["DaysLeft"] = df_analysis.apply(
-          lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
-          if row["SimulatedVelocity"] > 0
-          else 999,
-          axis=1,
-      )
-      today = datetime.now()
-      df_analysis["StockoutDate"] = df_analysis["DaysLeft"].apply(
-          lambda d: (today + timedelta(days=int(min(d, 3650)))).strftime(
-              "%Y-%m-%d"
-          )
-          if pd.notna(d) and d < 999
-          else "No Risk"
-      )
-
-      df_analysis = df_analysis.sort_values(
-          by="TotalRevenue", ascending=False
-      ).reset_index(drop=True)
-      df_analysis["CumulativeRevenue"] = df_analysis["TotalRevenue"].cumsum()
-      total_rev_sum = float(df_analysis["TotalRevenue"].sum())
-      if total_rev_sum > 0:
-        df_analysis["CumulativePct"] = (
-            df_analysis["CumulativeRevenue"] / total_rev_sum
-        )
-      else:
-        df_analysis["CumulativePct"] = 0.0
-
-      def classify_abc(pct):
-        if pct <= 0.80:
-          return "Class A (High Value - Strict Control)"
-        elif pct <= 0.95:
-          return "Class B (Moderate Value)"
-        else:
-          return "Class C (Long-Tail / Bulk)"
-
-      df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(
-          classify_abc
-      )
-
-      def sku_tier(row):
-        if row["SimulatedVelocity"] >= 5:
-          return "🔥 Best Seller (Fast Moving)"
-        elif row["SimulatedVelocity"] >= 1:
-          return "⚡ Steady Mover"
-        elif row["CurrentStock"] > 10 and row["SimulatedVelocity"] < 0.2:
-          return "⚠️ Dead Stock / Capital Trap"
-        else:
-          return "💤 Slow Moving"
-
-      df_analysis["SKU_Tier"] = df_analysis.apply(sku_tier, axis=1)
-
-      df_analysis["RecommendedOrderQty"] = df_analysis.apply(
-          lambda row: max(
-              0,
-              int(
-                  round(
-                      (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
-                      - row["CurrentStock"]
-                  )
-              ),
-          ),
-          axis=1,
-      )
-      df_analysis["EstimatedOrderCost"] = (
-          df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
-      )
-
-      st.markdown("### 📊 Enterprise Executive Performance Metrics")
-      col1, col2, col3, col4, col5 = st.columns(5)
-      col1.metric(
-          "Total Stock Capital",
-          f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}",
-      )
-      col2.metric(
-          "Projected Gross Profit",
-          f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
-      )
-      col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
-      col4.metric(
-          "Class A Core Items",
-          len(
-              df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
-          ),
-      )
-      col5.metric(
-          "Dead Stock Traps",
-          len(df_analysis[df_analysis["SKU_Tier"].str.contains("Dead Stock")]),
-      )
-      st.markdown("---")
-
-      col_ch1, col_ch2 = st.columns(2)
-      with col_ch1:
-        st.subheader("🌍 ABC Inventory Classification Breakdown")
-        fig_abc = px.pie(
-            df_analysis,
-            names="ABC_Category",
-            values="TotalRevenue",
-            color="ABC_Category",
-            color_discrete_map={
-                "Class A (High Value - Strict Control)": "#FF4B4B",
-                "Class B (Moderate Value)": "#FFA500",
-                "Class C (Long-Tail / Bulk)": "#2ECC71",
-            },
-        )
-        st.plotly_chart(fig_abc, use_container_width=True)
-      with col_ch2:
-        st.subheader("⚡ SKU Velocity vs Stock Level (Jumia Matrix)")
-        fig_jumia = px.scatter(
-            df_analysis,
-            x="CurrentStock",
-            y="SimulatedVelocity",
-            color="SKU_Tier",
-            size="CapitalTiedUp",
-            hover_data=["ItemName", "DaysLeft"],
-        )
-        st.plotly_chart(fig_jumia, use_container_width=True)
-      st.markdown("---")
-
-      st.subheader(
-          "🔮 Master Enterprise Supply Chain & Replenishment Dashboard"
-      )
-      display_cols = [
-          c
-          for c in [
-              "ItemName",
-              "ABC_Category",
-              "SKU_Tier",
-              "CurrentStock",
-              "SafetyStock",
-              "ReorderPoint",
-              "DaysLeft",
-              "StockoutDate",
-              "CapitalTiedUp",
-              "RecommendedOrderQty",
-              "EstimatedOrderCost",
-          ]
-          if c in df_analysis.columns
-      ]
-      st.dataframe(df_analysis[display_cols], use_container_width=True)
-
-      st.markdown("---")
-      st.subheader("📱 Automated Enterprise WhatsApp Supplier Dispatcher")
-      reorder_needed_df = df_analysis[
-          df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
-      ]
-      if not reorder_needed_df.empty:
-        selected_sku = st.selectbox(
-            "Select SKU to Dispatch Purchase Order",
-            reorder_needed_df["ItemName"].dropna().astype(str).tolist(),
-        )
-        sku_row = reorder_needed_df[
-            reorder_needed_df["ItemName"] == selected_sku
-        ].iloc[0]
-        raw_phone = (
-            sku_row["SupplierPhone"]
-            if "SupplierPhone" in sku_row and pd.notna(sku_row["SupplierPhone"])
-            else "233000000000"
-        )
-        digits_only = "".join(ch for ch in str(raw_phone) if ch.isdigit())
-        sup_phone = digits_only if digits_only else "233000000000"
-        order_msg = (
-            "Hello Supplier, automated reorder generated by Rogers Enterprise"
-            f" BI Suite. Item: *{sku_row['ItemName']}* | ABC Class:"
-            f" *{str(sku_row['ABC_Category']).split()[0]}* | Restock Quantity"
-            f" Required: *{sku_row['RecommendedOrderQty']} units* | Estimated PO"
-            f" Cost: *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
-            " fulfillment."
-        )
-        encoded_po = urllib.parse.quote(order_msg)
-        po_wa_url = f"https://wa.me/{sup_phone}?text={encoded_po}"
-        col_p1, col_p2 = st.columns([2, 1])
-        with col_p1:
-          st.info(
-              f"**Item:** {sku_row['ItemName']} | **Current Stock:**"
-              f" {sku_row['CurrentStock']} | **Reorder Point (ROP):**"
-              f" {sku_row['ReorderPoint']} | **Order Qty:**"
-              f" {sku_row['RecommendedOrderQty']} units"
-          )
-        with col_p2:
-          st.markdown(
-              f'<a href="{po_wa_url}" target="_blank" style="display:block;'
-              " text-align:center; background-color:#25D366; color:white;"
-              " padding:12px 15px; border-radius:6px; text-decoration:none;"
-              ' font-weight:bold; font-size:14px;">💬 Send WhatsApp PO</a>',
-              unsafe_allow_html=True,
-          )
-      else:
-        st.success(
-            "🎉 All inventory SKUs are safely above their Reorder Points (ROP)!"
-        )
-
-      st.markdown("---")
-      st.subheader("📥 Export Enterprise Intelligence Report")
-      csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
-      st.download_button(
-          label="Download Enterprise Inventory & ABC Report (CSV)",
-          data=csv_bytes,
-          file_name="enterprise_bi_inventory_report.csv",
-          mime="text/csv",
-      )
-  except Exception as e:
-    st.error(f"Error processing files: {e}")
-else:
-  st.info(
-      "👈 Please upload your Sales CSV and Current Stock CSV in the sidebar to"
-      " launch the Enterprise BI Suite."
-  )
-
-    # =========================================================
-# EXTRA FEATURE: UNIVERSAL CSV / EXCEL MULTITASK ANALYZER,
-# ANOMALY FLAGGER, COMMANDED CLEANER, DATE FORMATTER,
-# SWIFT MEASUREMENTS + REGRESSION & AI FUTURE DIAGNOSIS
-# =========================================================
-st.markdown("---")
-st.header("🧪 Universal CSV & Excel Multitask Data Lab")
-st.markdown(
-    "Upload **any CSV or Excel file** (`.csv`, `.xlsx`, `.xls`) to multitask"
-    " analysis, flag dangers/abnormalities, command cleaning or keep raw"
-    " formatting, inspect a **post-clean overview**, compare **Before vs."
-    " After formatting with conclusions**, format dates on button click, run"
-    " swift statistical & regression calculations, and get **AI Data Diagnosis"
-    " for Future Outlook**."
-)
+  forecasts = [
+      max(0.0, level + h * trend) for h in range(1, steps + 1)
+  ]
+  return np.array(forecasts, dtype=float)
 
 
-def detect_abnormalities(df: pd.DataFrame):
+def detect_abnormalities(df: pd.DataFrame) -> pd.DataFrame:
+  """Detect duplicates, nulls, negative numbers, zeros, IQR outliers, and bad dates."""
   flags = []
-  if df.empty:
+  if df is None or df.empty:
     return pd.DataFrame(flags)
 
   try:
@@ -909,6 +626,407 @@ def detect_abnormalities(df: pd.DataFrame):
   return pd.DataFrame(flags)
 
 
+# ---------------------------------------------------------
+# AUTHENTICATION GATE
+# ---------------------------------------------------------
+auth_conn = init_auth_db()
+if not render_auth_gate(auth_conn):
+  st.stop()
+
+current_user = st.session_state["auth_user"]
+
+# ---------------------------------------------------------
+# HEADER & LOGGED-IN SESSION CONTROLS
+# ---------------------------------------------------------
+st.title("🌍 Enterprise-Grade Supply Chain & BI Intelligence Suite")
+st.markdown(
+    "Inspired by **Amazon, Jumia, and Alibaba** operational architectures —"
+    " Featuring ABC-XYZ Classification, Safety Stock Buffers, SKU Tiering,"
+    " Universal CSV/Excel Multitask Analysis, Regression & AI Future Diagnosis."
+    " Empowered by **Rogers Enterprises Limited | Ghana**."
+)
+
+# ---------------------------------------------------------
+# SIDEBAR DATA INPUTS, USER PROFILE & SETTINGS
+# ---------------------------------------------------------
+st.sidebar.success(
+    f"👤 **{current_user['full_name']}** (@{current_user['username']})\n"
+    f"Role: `{current_user['role']}`"
+)
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
+  st.session_state.pop("auth_user", None)
+  st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.header("📁 Enterprise Data Inputs")
+sales_file = st.sidebar.file_uploader(
+    "Upload Sales CSV (Columns: Date, ItemName, QuantitySold, UnitPrice)",
+    type=["csv"],
+)
+stock_file = st.sidebar.file_uploader(
+    "Upload Current Stock CSV (Columns: ItemName, CurrentStock, CostPrice,"
+    " SellingPrice, SupplierPhone)",
+    type=["csv"],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Supply Chain Parameters")
+supplier_lead_time = st.sidebar.slider("Supplier Lead Time (Days)", 1, 30, 7)
+service_level_factor = st.sidebar.selectbox(
+    "Service Level Safety Buffer", [1.28, 1.65, 2.05], index=1
+)
+sales_growth_slider = st.sidebar.slider(
+    "Demand Volatility / Growth Simulation (%)", -50, 100, 0, step=5
+)
+
+# ---------------------------------------------------------
+# MODULE 1: ENTERPRISE SUPPLY CHAIN & ABC-XYZ BI ENGINE
+# ---------------------------------------------------------
+if sales_file and stock_file:
+  try:
+    df_sales = pd.read_csv(sales_file)
+    df_stock = pd.read_csv(stock_file)
+
+    item_col_sales = find_col_case_insensitive(df_sales, "ItemName")
+    qty_col_sales = find_col_case_insensitive(df_sales, "QuantitySold")
+    price_col_sales = find_col_case_insensitive(df_sales, "UnitPrice")
+
+    item_col_stock = find_col_case_insensitive(df_stock, "ItemName")
+    curr_stock_col = find_col_case_insensitive(df_stock, "CurrentStock")
+    cost_price_col = find_col_case_insensitive(df_stock, "CostPrice")
+    sell_price_col = find_col_case_insensitive(df_stock, "SellingPrice")
+    phone_col_stock = find_col_case_insensitive(df_stock, "SupplierPhone")
+
+    if not all([item_col_sales, qty_col_sales, price_col_sales]):
+      st.error(
+          "Sales CSV must include ItemName, QuantitySold, and UnitPrice columns."
+      )
+    elif not all([item_col_stock, curr_stock_col, cost_price_col]):
+      st.error(
+          "Stock CSV must include ItemName, CurrentStock, and CostPrice"
+          " columns."
+      )
+    else:
+      df_sales = df_sales.copy()
+      df_stock = df_stock.copy()
+      df_sales["_item"] = df_sales[item_col_sales].apply(clean_text_cell)
+      df_sales["_qty"] = clean_numeric_series(df_sales[qty_col_sales]).fillna(0.0)
+      df_sales["_price"] = clean_numeric_series(
+          df_sales[price_col_sales]
+      ).fillna(0.0)
+      df_sales["TotalRevenue"] = df_sales["_qty"] * df_sales["_price"]
+
+      item_sales = (
+          df_sales.dropna(subset=["_item"])
+          .groupby("_item", as_index=False)
+          .agg(
+              QuantitySold=("_qty", "sum"),
+              OrderCount=("_qty", "count"),
+              QtyStd=("_qty", "std"),
+              TotalRevenue=("TotalRevenue", "sum"),
+          )
+          .rename(columns={"_item": "ItemName"})
+      )
+      item_sales["QtyStd"] = item_sales["QtyStd"].fillna(0.0)
+
+      df_stock["ItemName"] = df_stock[item_col_stock].apply(clean_text_cell)
+      df_stock["CurrentStock"] = clean_numeric_series(
+          df_stock[curr_stock_col]
+      ).fillna(0.0)
+      df_stock["CostPrice"] = clean_numeric_series(
+          df_stock[cost_price_col]
+      ).fillna(0.0)
+      if sell_price_col:
+        df_stock["SellingPrice"] = clean_numeric_series(
+            df_stock[sell_price_col]
+        ).fillna(df_stock["CostPrice"] * 1.3)
+      else:
+        df_stock["SellingPrice"] = df_stock["CostPrice"] * 1.3
+      if phone_col_stock:
+        df_stock["SupplierPhone"] = df_stock[phone_col_stock].apply(
+            clean_text_cell
+        )
+
+      df_analysis = pd.merge(df_stock, item_sales, on="ItemName", how="left")
+      df_analysis["QuantitySold"] = df_analysis["QuantitySold"].fillna(0.0)
+      df_analysis["OrderCount"] = df_analysis["OrderCount"].fillna(0.0)
+      df_analysis["QtyStd"] = df_analysis["QtyStd"].fillna(0.0)
+      df_analysis["TotalRevenue"] = df_analysis["TotalRevenue"].fillna(0.0)
+
+      df_analysis["TotalPotentialRevenue"] = (
+          df_analysis["CurrentStock"] * df_analysis["SellingPrice"]
+      )
+      df_analysis["CapitalTiedUp"] = (
+          df_analysis["CurrentStock"] * df_analysis["CostPrice"]
+      )
+      df_analysis["PotentialProfit"] = (
+          df_analysis["TotalPotentialRevenue"] - df_analysis["CapitalTiedUp"]
+      )
+
+      days_analyzed = 30.0
+      base_velocity = df_analysis["QuantitySold"] / days_analyzed
+      df_analysis["SimulatedVelocity"] = base_velocity * (
+          1.0 + (sales_growth_slider / 100.0)
+      )
+
+      # Coefficient of variation (CV) for XYZ demand stability classification
+      mean_qty = np.where(
+          df_analysis["OrderCount"] > 0,
+          df_analysis["QuantitySold"] / np.maximum(df_analysis["OrderCount"], 1.0),
+          0.0,
+      )
+      df_analysis["DemandCV"] = np.where(
+          mean_qty > 0, df_analysis["QtyStd"] / mean_qty, 0.0
+      )
+
+      def classify_xyz(cv: float) -> str:
+        if cv <= 0.5:
+          return "X (Steady Demand)"
+        if cv <= 1.0:
+          return "Y (Variable Demand)"
+        return "Z (Erratic / Lumpy)"
+
+      df_analysis["XYZ_Class"] = df_analysis["DemandCV"].apply(classify_xyz)
+
+      df_analysis["SafetyStock"] = (
+          df_analysis["SimulatedVelocity"]
+          * 0.2
+          * supplier_lead_time
+          * float(service_level_factor)
+      ).apply(lambda x: max(1, int(round(x))) if pd.notna(x) else 1)
+
+      df_analysis["ReorderPoint"] = (
+          df_analysis["SimulatedVelocity"] * supplier_lead_time
+          + df_analysis["SafetyStock"]
+      ).apply(lambda x: int(round(x)) if pd.notna(x) else 0)
+
+      df_analysis["DaysLeft"] = df_analysis.apply(
+          lambda row: round(row["CurrentStock"] / row["SimulatedVelocity"], 1)
+          if row["SimulatedVelocity"] > 0
+          else 999,
+          axis=1,
+      )
+      today = datetime.now()
+      df_analysis["StockoutDate"] = df_analysis["DaysLeft"].apply(
+          lambda d: (today + timedelta(days=int(min(d, 3650)))).strftime(
+              "%Y-%m-%d"
+          )
+          if pd.notna(d) and d < 999
+          else "No Risk"
+      )
+
+      df_analysis = df_analysis.sort_values(
+          by="TotalRevenue", ascending=False
+      ).reset_index(drop=True)
+      df_analysis["CumulativeRevenue"] = df_analysis["TotalRevenue"].cumsum()
+      total_rev_sum = float(df_analysis["TotalRevenue"].sum())
+      if total_rev_sum > 0:
+        df_analysis["CumulativePct"] = (
+            df_analysis["CumulativeRevenue"] / total_rev_sum
+        )
+      else:
+        df_analysis["CumulativePct"] = 0.0
+
+      def classify_abc(pct: float) -> str:
+        if pct <= 0.80:
+          return "Class A (High Value - Strict Control)"
+        if pct <= 0.95:
+          return "Class B (Moderate Value)"
+        return "Class C (Long-Tail / Bulk)"
+
+      df_analysis["ABC_Category"] = df_analysis["CumulativePct"].apply(
+          classify_abc
+      )
+      df_analysis["ABC_XYZ_Matrix"] = (
+          df_analysis["ABC_Category"].str.slice(0, 7)
+          + " + "
+          + df_analysis["XYZ_Class"].str.slice(0, 1)
+      )
+
+      def sku_tier(row) -> str:
+        if row["SimulatedVelocity"] >= 5:
+          return "🔥 Best Seller (Fast Moving)"
+        if row["SimulatedVelocity"] >= 1:
+          return "⚡ Steady Mover"
+        if row["CurrentStock"] > 10 and row["SimulatedVelocity"] < 0.2:
+          return "⚠️ Dead Stock / Capital Trap"
+        return "💤 Slow Moving"
+
+      df_analysis["SKU_Tier"] = df_analysis.apply(sku_tier, axis=1)
+
+      df_analysis["RecommendedOrderQty"] = df_analysis.apply(
+          lambda row: max(
+              0,
+              int(
+                  round(
+                      (row["SimulatedVelocity"] * 30 + row["SafetyStock"])
+                      - row["CurrentStock"]
+                  )
+              ),
+          ),
+          axis=1,
+      )
+      df_analysis["EstimatedOrderCost"] = (
+          df_analysis["RecommendedOrderQty"] * df_analysis["CostPrice"]
+      )
+
+      st.markdown("### 📊 Enterprise Executive Performance Metrics")
+      col1, col2, col3, col4, col5 = st.columns(5)
+      col1.metric(
+          "Total Stock Capital",
+          f"GHS {df_analysis['CapitalTiedUp'].sum():,.2f}",
+      )
+      col2.metric(
+          "Projected Gross Profit",
+          f"GHS {df_analysis['PotentialProfit'].sum():,.2f}",
+      )
+      col3.metric("Total Sales Revenue", f"GHS {total_rev_sum:,.2f}")
+      col4.metric(
+          "Class A Core Items",
+          len(
+              df_analysis[df_analysis["ABC_Category"].str.contains("Class A")]
+          ),
+      )
+      col5.metric(
+          "Dead Stock Traps",
+          len(df_analysis[df_analysis["SKU_Tier"].str.contains("Dead Stock")]),
+      )
+      st.markdown("---")
+
+      col_ch1, col_ch2 = st.columns(2)
+      with col_ch1:
+        st.subheader("🌍 ABC Inventory Classification Breakdown")
+        fig_abc = px.pie(
+            df_analysis,
+            names="ABC_Category",
+            values="TotalRevenue",
+            color="ABC_Category",
+            color_discrete_map={
+                "Class A (High Value - Strict Control)": "#FF4B4B",
+                "Class B (Moderate Value)": "#FFA500",
+                "Class C (Long-Tail / Bulk)": "#2ECC71",
+            },
+        )
+        st.plotly_chart(fig_abc, use_container_width=True)
+      with col_ch2:
+        st.subheader("⚡ SKU Velocity vs Stock Level (Jumia Matrix)")
+        fig_jumia = px.scatter(
+            df_analysis,
+            x="CurrentStock",
+            y="SimulatedVelocity",
+            color="SKU_Tier",
+            size="CapitalTiedUp",
+            hover_data=["ItemName", "DaysLeft", "ABC_XYZ_Matrix"],
+        )
+        st.plotly_chart(fig_jumia, use_container_width=True)
+      st.markdown("---")
+
+      st.subheader(
+          "🔮 Master Enterprise Supply Chain & Replenishment Dashboard"
+      )
+      display_cols = [
+          c
+          for c in [
+              "ItemName",
+              "ABC_Category",
+              "XYZ_Class",
+              "ABC_XYZ_Matrix",
+              "SKU_Tier",
+              "CurrentStock",
+              "SafetyStock",
+              "ReorderPoint",
+              "DaysLeft",
+              "StockoutDate",
+              "CapitalTiedUp",
+              "RecommendedOrderQty",
+              "EstimatedOrderCost",
+          ]
+          if c in df_analysis.columns
+      ]
+      st.dataframe(df_analysis[display_cols], use_container_width=True)
+
+      st.markdown("---")
+      st.subheader("📱 Automated Enterprise WhatsApp Supplier Dispatcher")
+      reorder_needed_df = df_analysis[
+          df_analysis["CurrentStock"] <= df_analysis["ReorderPoint"]
+      ]
+      if not reorder_needed_df.empty:
+        selected_sku = st.selectbox(
+            "Select SKU to Dispatch Purchase Order",
+            reorder_needed_df["ItemName"].dropna().astype(str).tolist(),
+        )
+        sku_row = reorder_needed_df[
+            reorder_needed_df["ItemName"] == selected_sku
+        ].iloc[0]
+        raw_phone = (
+            sku_row["SupplierPhone"]
+            if "SupplierPhone" in sku_row and pd.notna(sku_row["SupplierPhone"])
+            else "233000000000"
+        )
+        digits_only = "".join(ch for ch in str(raw_phone) if ch.isdigit())
+        sup_phone = digits_only if digits_only else "233000000000"
+        order_msg = (
+            "Hello Supplier, automated reorder generated by Rogers Enterprise"
+            f" Suite. Item: *{sku_row['ItemName']}* | Matrix:"
+            f" *{sku_row['ABC_XYZ_Matrix']}* | Restock Quantity Required:"
+            f" *{sku_row['RecommendedOrderQty']} units* | Estimated PO Cost:"
+            f" *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
+            " fulfillment."
+        )
+        encoded_po = urllib.parse.quote(order_msg)
+        po_wa_url = f"https://wa.me/{sup_phone}?text={encoded_po}"
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+          st.info(
+              f"**Item:** {sku_row['ItemName']} | **Matrix:**"
+              f" {sku_row['ABC_XYZ_Matrix']} | **Current Stock:**"
+              f" {sku_row['CurrentStock']} | **Reorder Point (ROP):**"
+              f" {sku_row['ReorderPoint']} | **Order Qty:**"
+              f" {sku_row['RecommendedOrderQty']} units"
+          )
+        with col_p2:
+          st.markdown(
+              f'<a href="{po_wa_url}" target="_blank" style="display:block;'
+              " text-align:center; background-color:#25D366; color:white;"
+              " padding:12px 15px; border-radius:6px; text-decoration:none;"
+              ' font-weight:bold; font-size:14px;">💬 Send WhatsApp PO</a>',
+              unsafe_allow_html=True,
+          )
+      else:
+        st.success(
+            "🎉 All inventory SKUs are safely above their Reorder Points (ROP)!"
+        )
+
+      st.markdown("---")
+      st.subheader("📥 Export Enterprise Intelligence Report")
+      csv_bytes = df_analysis.to_csv(index=False).encode("utf-8")
+      st.download_button(
+          label="Download Enterprise Inventory & ABC-XYZ Report (CSV)",
+          data=csv_bytes,
+          file_name="enterprise_bi_inventory_report.csv",
+          mime="text/csv",
+      )
+  except Exception as e:
+    st.error(f"Error processing files: {e}")
+else:
+  st.info(
+      "👈 Please upload your Sales CSV and Current Stock CSV in the sidebar to"
+      " launch the Enterprise BI Suite."
+  )
+
+# ---------------------------------------------------------
+# MODULE 2: UNIVERSAL CSV / EXCEL MULTITASK DATA LAB
+# ---------------------------------------------------------
+st.markdown("---")
+st.header("🧪 Universal CSV & Excel Multitask Data Lab")
+st.markdown(
+    "Upload **any CSV or Excel file** (`.csv`, `.xlsx`, `.xls`) to multitask"
+    " analysis, flag dangers/abnormalities, command cleaning or keep raw"
+    " formatting, format dates on button click, highlight fixed areas, run"
+    " swift statistical, correlation & regression calculations, and get **AI Data"
+    " Diagnosis for Future Outlook**."
+)
+
 lab_file = st.file_uploader(
     "Upload Any CSV or Excel File for Multitask Analysis",
     type=["csv", "xlsx", "xls"],
@@ -919,18 +1037,16 @@ if lab_file is not None:
   file_sig = f"{lab_file.name}_{lab_file.size}"
   if st.session_state.get("lab_file_sig") != file_sig:
     st.session_state["lab_file_sig"] = file_sig
-    loaded_df = load_any_tabular_file(lab_file, key_prefix="lab_main")
-    st.session_state["lab_working_df"] = loaded_df
-    st.session_state["lab_initial_metrics"] = snapshot_metrics(loaded_df)
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
     st.session_state["lab_fix_highlights"] = []
-    st.session_state["lab_clean_report"] = None
 
   if "lab_working_df" not in st.session_state:
-    loaded_df = load_any_tabular_file(lab_file, key_prefix="lab_main")
-    st.session_state["lab_working_df"] = loaded_df
-    st.session_state["lab_initial_metrics"] = snapshot_metrics(loaded_df)
+    st.session_state["lab_working_df"] = load_any_tabular_file(
+        lab_file, key_prefix="lab_main"
+    )
     st.session_state["lab_fix_highlights"] = []
-    st.session_state["lab_clean_report"] = None
 
   work_df = st.session_state["lab_working_df"].copy()
 
@@ -944,7 +1060,6 @@ if lab_file is not None:
     dup_total = 0
   k4.metric("Duplicate Rows", f"{dup_total:,}")
 
-  # 1. DANGERS & ABNORMALITIES SCANNER
   st.subheader("🚨 Dangers & Abnormalities Scanner")
   df_flags = detect_abnormalities(work_df)
   if not df_flags.empty:
@@ -955,7 +1070,6 @@ if lab_file is not None:
         " abnormalities detected."
     )
 
-  # 2. PROMPT AREAS NEEDING FORMATTING + CLEAN / DO NOT CLEAN COMMANDS
   st.subheader("🧭 Formatting Prompts & Action Commands")
   st.caption(
       "Review areas prompted for formatting and choose **Clean & Format** or"
@@ -1021,158 +1135,50 @@ if lab_file is not None:
     apply_clean_cmd = st.form_submit_button("⚡ Execute Selected Clean Commands")
 
   if apply_clean_cmd:
-    before_snap = snapshot_metrics(work_df)
     applied_notes = []
-    actions_taken = []
-
     if col_headers_dirty and cmd_headers.startswith("Clean"):
       rename_map = {
           c: " ".join(str(c).strip().split()) for c in col_headers_dirty
       }
       work_df = work_df.rename(columns=rename_map)
-      msg = (
-          f"Trimmed/normalized {len(rename_map)} header(s):"
+      applied_notes.append(
+          f"Formatted {len(rename_map)} column header(s):"
           f" {list(rename_map.values())}"
       )
-      applied_notes.append(msg)
-      actions_taken.append(msg)
 
     if cmd_text_trim.startswith("Clean"):
-      text_touched = 0
       for c in work_df.columns:
         if (
             work_df[c].dtype == object
             or pd.api.types.is_string_dtype(work_df[c])
         ):
           work_df[c] = work_df[c].apply(clean_text_cell)
-          text_touched += 1
-      msg = (
-          f"Standardized whitespace and converted empty/placeholder strings to"
-          f" true nulls across {text_touched} text column(s)."
+      applied_notes.append(
+          "Trimmed extra whitespace and standardized blank text markers across"
+          " text columns."
       )
-      applied_notes.append(msg)
-      actions_taken.append(msg)
 
     if numeric_candidate_cols and cmd_num_parse.startswith("Clean"):
-      num_converted = []
       for c in numeric_candidate_cols:
         if c in work_df.columns:
           work_df[c] = clean_numeric_series(work_df[c])
-          num_converted.append(str(c))
-      if num_converted:
-        msg = (
-            "Stripped currency/comma symbols and parsed numeric values in:"
-            f" {', '.join(num_converted)}."
-        )
-        applied_notes.append(msg)
-        actions_taken.append(msg)
+      applied_notes.append(
+          "Converted currency/symbol numeric strings to clean numbers in:"
+          f" {numeric_candidate_cols}"
+      )
 
     if cmd_dedup.startswith("Clean & Remove"):
       before_len = len(work_df)
       work_df = work_df.drop_duplicates().reset_index(drop=True)
       removed_cnt = before_len - len(work_df)
-      msg = f"Removed {removed_cnt} exact duplicate row(s)."
-      applied_notes.append(msg)
-      actions_taken.append(msg)
-
-    after_snap = snapshot_metrics(work_df)
-
-    # Draw conclusions from Before vs. After
-    conclusions = []
-    if after_snap["duplicates"] < before_snap["duplicates"]:
-      conclusions.append(
-          f"Duplicate inflation was eliminated ({before_snap['duplicates']} →"
-          f" {after_snap['duplicates']}), preventing double-counting in totals"
-          " and averages."
-      )
-    if after_snap["numeric_ready_cols"] > before_snap["numeric_ready_cols"]:
-      conclusions.append(
-          f"Numeric readiness improved ({before_snap['numeric_ready_cols']} →"
-          f" {after_snap['numeric_ready_cols']} numeric columns), enabling"
-          " reliable statistical summaries, regression, and forecasting."
-      )
-    if after_snap["missing_cells"] > before_snap["missing_cells"]:
-      conclusions.append(
-          f"Hidden text placeholders ('nan'/'None'/blanks) were surfaced as"
-          f" explicit missing values ({before_snap['missing_cells']} →"
-          f" {after_snap['missing_cells']}), making data gaps transparent"
-          " rather than disguised as text."
-      )
-    if not conclusions:
-      conclusions.append(
-          "Dataset structure and integrity remain consistent; selected rules"
-          " were applied without distorting record counts."
-      )
-
-    overview_str = (
-        "; ".join(actions_taken)
-        if actions_taken
-        else "No cleaning rules were selected ('Do Not Clean' chosen)."
-    )
-    conclusion_str = " ".join(conclusions)
+      applied_notes.append(f"Removed {removed_cnt} exact duplicate row(s).")
 
     st.session_state["lab_working_df"] = work_df
     st.session_state["lab_fix_highlights"] = (
         st.session_state.get("lab_fix_highlights", []) + applied_notes
     )
-    st.session_state["lab_clean_report"] = {
-        "before": before_snap,
-        "after": after_snap,
-        "overview": overview_str,
-        "conclusions": conclusions,
-    }
-    record_clean_audit(
-        active_user["email"], lab_file.name, overview_str, conclusion_str
-    )
     st.rerun()
 
-  # BRIEF OVERVIEW + BEFORE VS AFTER COMPARISON + CONCLUSIONS
-  if st.session_state.get("lab_clean_report"):
-    rep = st.session_state["lab_clean_report"]
-    st.markdown("### 📋 Post-Clean Overview, Before vs. After & Conclusions")
-    st.info(f"**Brief Overview of What Formatting Did:** {rep['overview']}")
-
-    b_m = rep["before"]
-    a_m = rep["after"]
-    comp_df = pd.DataFrame([
-        {
-            "Metric": "Row Count",
-            "Before Formatting": b_m["rows"],
-            "After Formatting": a_m["rows"],
-            "Change": a_m["rows"] - b_m["rows"],
-        },
-        {
-            "Metric": "Column Count",
-            "Before Formatting": b_m["cols"],
-            "After Formatting": a_m["cols"],
-            "Change": a_m["cols"] - b_m["cols"],
-        },
-        {
-            "Metric": "Missing / Null Cells",
-            "Before Formatting": b_m["missing_cells"],
-            "After Formatting": a_m["missing_cells"],
-            "Change": a_m["missing_cells"] - b_m["missing_cells"],
-        },
-        {
-            "Metric": "Exact Duplicate Rows",
-            "Before Formatting": b_m["duplicates"],
-            "After Formatting": a_m["duplicates"],
-            "Change": a_m["duplicates"] - b_m["duplicates"],
-        },
-        {
-            "Metric": "Numeric-Ready Columns",
-            "Before Formatting": b_m["numeric_ready_cols"],
-            "After Formatting": a_m["numeric_ready_cols"],
-            "Change": a_m["numeric_ready_cols"] - b_m["numeric_ready_cols"],
-        },
-    ])
-    st.dataframe(comp_df, use_container_width=True)
-
-    st.markdown("**🔍 Key Conclusions:**")
-    for c_line in rep["conclusions"]:
-      st.success(f"• {c_line}")
-
-  # 3. ON-DEMAND DATE FORMATTER BUTTON
   st.subheader("📅 On-Demand Date Formatter")
   date_col_candidates = list(work_df.columns)
   default_date_idx = next(
@@ -1220,15 +1226,8 @@ if lab_file is not None:
     st.session_state["lab_fix_highlights"] = (
         st.session_state.get("lab_fix_highlights", []) + [note]
     )
-    record_clean_audit(
-        active_user["email"],
-        lab_file.name,
-        note,
-        f"Date column '{selected_date_col}' standardized to {target_date_fmt} for chronological accuracy.",
-    )
     st.rerun()
 
-  # 4. HIGHLIGHT AREAS FIXED & FORMATTED
   if st.session_state.get("lab_fix_highlights"):
     st.markdown("#### ✨ Highlighted Fixes & Formatting Applied")
     for item_note in st.session_state["lab_fix_highlights"]:
@@ -1236,11 +1235,10 @@ if lab_file is not None:
 
   st.dataframe(work_df, use_container_width=True)
 
-    # 5. SWIFT MEASUREMENTS & REGRESSION CALCULATOR
   st.markdown("---")
   st.subheader(
-      "📐 Swift Measurements & Regression Calculator (Mean, Average, Median,"
-      " COUNT, COUNTA, COUNTIFS)"
+      "📐 Swift Measurements, Correlation & Regression Calculator (Mean,"
+      " Average, Median, COUNT, COUNTA, COUNTIFS)"
   )
 
   numeric_cols_now = [
@@ -1373,6 +1371,15 @@ if lab_file is not None:
             title=f"Regression Trend: {y_col} vs {x_col}",
         )
         st.plotly_chart(fig_reg, use_container_width=True)
+
+        # Pairwise correlation ranking across numeric features
+        clean_num_frame = pd.DataFrame(
+            {str(c): clean_numeric_series(work_df[c]) for c in numeric_cols_now}
+        ).dropna(how="all")
+        if len(clean_num_frame.columns) >= 2 and len(clean_num_frame) >= 2:
+          corr_matrix = clean_num_frame.corr(numeric_only=True)
+          st.markdown("**🔗 Numeric Correlation Matrix**")
+          st.dataframe(corr_matrix.round(3), use_container_width=True)
       else:
         st.info(
             "Need at least 2 valid numeric pairs with variation in X to fit a"
@@ -1384,12 +1391,11 @@ if lab_file is not None:
           " regression."
       )
 
-    # 6. AI DATA DIAGNOSIS TO PREDICT FUTURE LOOK AT DATA
     st.markdown("---")
     st.subheader("🔮 AI Data Diagnosis & Future Trajectory Outlook")
     st.caption(
-        "AI inspects data quality, trend momentum, and volatility to diagnose"
-        " future behavior across your dataset."
+        "Combines data health scoring, linear momentum, and Holt trend"
+        " smoothing to diagnose future behavior across your dataset."
     )
 
     ai_col1, ai_col2 = st.columns([2, 1])
@@ -1432,12 +1438,20 @@ if lab_file is not None:
     if len(diag_series) >= 2:
       t_idx = np.arange(len(diag_series), dtype=float)
       m_trend, b_trend = np.polyfit(t_idx, diag_series.values, 1)
-      future_t = np.arange(
-          len(diag_series), len(diag_series) + horizon_steps, dtype=float
+      holt_vals = compute_exponential_forecast(
+          diag_series, steps=horizon_steps
       )
-      future_vals = np.maximum(0.0, m_trend * future_t + b_trend)
-      avg_future = float(np.mean(future_vals))
-      end_future = float(future_vals[-1])
+      linear_future = np.maximum(
+          0.0,
+          m_trend
+          * np.arange(
+              len(diag_series), len(diag_series) + horizon_steps, dtype=float
+          )
+          + b_trend,
+      )
+      blended_future = 0.5 * holt_vals + 0.5 * linear_future
+      avg_future = float(np.mean(blended_future))
+      end_future = float(blended_future[-1])
       current_last = float(diag_series.iloc[-1])
 
       if m_trend > 0.01:
@@ -1497,8 +1511,8 @@ if lab_file is not None:
           "Step": np.arange(
               len(diag_series) + 1, len(diag_series) + horizon_steps + 1
           ),
-          "Value": future_vals,
-          "Series": "AI Future Forecast",
+          "Value": blended_future,
+          "Series": "AI Blended Forecast (Holt + Linear)",
       })
       plot_outlook_df = pd.concat([hist_df, fut_df], ignore_index=True)
       fig_outlook = px.line(
@@ -1531,11 +1545,3 @@ if lab_file is not None:
       mime="text/csv",
       key="lab_download_cleaned",
   )
-
-# ---------------------------------------------------------
-# FOOTER
-# ---------------------------------------------------------
-st.markdown("---")
-st.caption(
-    f"**{DEVELOPER_ORG}** • Support & Inquiries: `{DEVELOPER_EMAIL}`"
-)
