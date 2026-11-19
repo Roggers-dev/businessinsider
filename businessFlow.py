@@ -1517,18 +1517,24 @@ def fetch_transactions_cached(days: int) -> pd.DataFrame:
     df["unit_price"] = df["unit_price"].apply(safe_float)
     df["total_amount"] = df["total_amount"].apply(safe_float)
     return df
-    def fetch_transactions(days: int = 90) -> pd.DataFrame:
-    empty_cols = [
-        "id", "tx_type", "sku", "product_name", "quantity",
-        "unit_price", "total_amount", "recorded_by", "notes", "created_at",
-    ]
-    try:
-        return fetch_transactions_cached(max(1, safe_int(days, 90)))
-    except Exception as exc:
-        st.error(f"Failed to load transactions: {exc}")
-        return pd.DataFrame(columns=empty_cols)
-
-
+def fetch_transactions(days: int = 90) -> pd.DataFrame:
+        empty_cols = [
+            "id",
+            "tx_type",
+            "sku",
+            "product_name",
+            "quantity",
+            "unit_price",
+            "total_amount",
+            "recorded_by",
+            "notes",
+            "created_at",
+        ]
+        try:
+            return fetch_transactions_cached(max(1, safe_int(days, 90)))
+        except Exception as exc:
+            st.error(f"Failed to load transactions: {exc}")
+            return pd.DataFrame(columns=empty_cols)
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_audit_logs_cached(limit: int) -> pd.DataFrame:
     return run_read_query(
