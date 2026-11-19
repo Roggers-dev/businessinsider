@@ -22,7 +22,7 @@ st.set_page_config(
 
 
 # ==============================================================================
-# 1. BULLETPROOF DATABASE CONNECTION & RETRY ENGINE
+# 1. DATABASE CONNECTION & RETRY ENGINE
 # ==============================================================================
 def get_neon_url() -> str:
     """Resolve the Neon Postgres connection URL safely from Streamlit secrets."""
@@ -109,6 +109,18 @@ def run_write_tx(fn):
     raise last_exc  # type: ignore[misc]
 
 
+def _try_step(cur, sql: str, params: tuple | list | None = None, step_name: str = "step"):
+    """Run a single DDL/DML statement inside a SAVEPOINT so one legacy quirk doesn't abort the tx."""
+    sp = "sp_schema_guard"
+    cur.execute(f"SAVEPOINT {sp};")
+    try:
+        cur.execute(sql, params or ())
+        cur.execute(f"RELEASE SAVEPOINT {sp};")
+    except Exception as exc:
+        cur.execute(f"ROLLBACK TO SAVEPOINT {sp};")
+        logger.warning("Schema step '%s' skipped/adjusted: %s", step_name, exc)
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -166,7 +178,8 @@ def verify_password(password: str, stored_hash: str | None) -> bool:
 # 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
 # ==============================================================================
 def _apply_schema_and_seed(cur):
-    cur.execute(
+    _try_step(
+        cur,
         """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -179,42 +192,46 @@ def _apply_schema_and_seed(cur):
             reset_expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
-        """
+        """,
+        step_name="create_users",
     )
 
-    # Inspect existing columns on `users` so migrations adapt safely
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'users';
-        """
-    )
-    existing_cols = {r["column_name"] for r in cur.fetchall()}
+    existing_cols: set[str] = set()
+    try:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'users';
+            """
+        )
+        existing_cols = {str(r["column_name"]) for r in cur.fetchall() if r.get("column_name")}
+    except Exception as exc:
+        logger.warning("Could not inspect users columns: %s", exc)
 
     if "username" not in existing_cols:
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);")
-        if "email" in existing_cols:
-            cur.execute(
-                "UPDATE users SET username = LOWER(TRIM(email)) WHERE username IS NULL AND email IS NOT NULL;"
-            )
-        elif "user_name" in existing_cols:
-            cur.execute(
-                "UPDATE users SET username = LOWER(TRIM(user_name)) WHERE username IS NULL AND user_name IS NOT NULL;"
-            )
-        elif "login" in existing_cols:
-            cur.execute(
-                "UPDATE users SET username = LOWER(TRIM(login)) WHERE username IS NULL AND login IS NOT NULL;"
-            )
+        _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);", step_name="add_username")
+        for candidate in ("email", "user_name", "login", "name"):
+            if candidate in existing_cols:
+                _try_step(
+                    cur,
+                    f"UPDATE users SET username = LOWER(TRIM({candidate}::text)) WHERE (username IS NULL OR TRIM(username) = '') AND {candidate} IS NOT NULL AND TRIM({candidate}::text) <> '';",
+                    step_name=f"backfill_username_from_{candidate}",
+                )
         if "id" in existing_cols:
-            cur.execute(
-                "UPDATE users SET username = 'user_' || id::text WHERE username IS NULL OR TRIM(username) = '';"
+            _try_step(
+                cur,
+                "UPDATE users SET username = 'user_' || id::text WHERE username IS NULL OR TRIM(username) = '';",
+                step_name="backfill_username_from_id",
             )
         else:
-            cur.execute(
-                "UPDATE users SET username = 'staff_user' WHERE username IS NULL OR TRIM(username) = '';"
+            _try_step(
+                cur,
+                "UPDATE users SET username = 'staff_user' WHERE username IS NULL OR TRIM(username) = '';",
+                step_name="backfill_username_default",
             )
-        cur.execute(
+        _try_step(
+            cur,
             """
             DO $$
             BEGIN
@@ -224,28 +241,35 @@ def _apply_schema_and_seed(cur):
                     ALTER TABLE users ADD CONSTRAINT users_username_unique UNIQUE (username);
                 END IF;
             END$$;
-            """
+            """,
+            step_name="add_username_unique",
         )
 
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'staff';")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TIMESTAMPTZ;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;")
+    for ddl, label in [
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';", "add_full_name"),
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'staff';", "add_role"),
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;", "add_is_active"),
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;", "add_reset_token"),
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TIMESTAMPTZ;", "add_reset_expires_at"),
+        ("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "add_created_at"),
+    ]:
+        _try_step(cur, ddl, step_name=label)
 
-    cur.execute(
+    _try_step(
+        cur,
         """
         UPDATE users
         SET full_name = username
         WHERE (full_name IS NULL OR TRIM(full_name) = '' OR full_name = 'User')
           AND username IS NOT NULL AND TRIM(username) <> '';
-        """
+        """,
+        step_name="sync_full_name",
     )
-    cur.execute("UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';")
-    cur.execute("UPDATE users SET is_active = TRUE WHERE is_active IS NULL;")
+    _try_step(cur, "UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';", step_name="sync_role")
+    _try_step(cur, "UPDATE users SET is_active = TRUE WHERE is_active IS NULL;", step_name="sync_is_active")
 
-    cur.execute(
+    _try_step(
+        cur,
         """
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
@@ -258,10 +282,12 @@ def _apply_schema_and_seed(cur):
             reorder_level INTEGER NOT NULL DEFAULT 10,
             updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
-        """
+        """,
+        step_name="create_products",
     )
 
-    cur.execute(
+    _try_step(
+        cur,
         """
         CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
@@ -276,10 +302,12 @@ def _apply_schema_and_seed(cur):
             notes TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
-        """
+        """,
+        step_name="create_transactions",
     )
 
-    cur.execute(
+    _try_step(
+        cur,
         """
         CREATE TABLE IF NOT EXISTS audit_logs (
             id SERIAL PRIMARY KEY,
@@ -288,20 +316,23 @@ def _apply_schema_and_seed(cur):
             details TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
-        """
+        """,
+        step_name="create_audit_logs",
     )
 
     cur.execute("SELECT COUNT(*) AS cnt FROM users;")
     row = cur.fetchone()
     user_count = safe_int(row["cnt"] if row else 0)
     if user_count == 0:
-        cur.execute(
+        _try_step(
+            cur,
             """
             INSERT INTO users (username, full_name, role, password_hash)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (username) DO NOTHING;
             """,
             ("admin", "System Administrator", "admin", hash_password("Admin@1234")),
+            step_name="seed_admin",
         )
 
     cur.execute("SELECT COUNT(*) AS cnt FROM products;")
@@ -314,15 +345,21 @@ def _apply_schema_and_seed(cur):
             ("SKU-1003", "POS Cash Drawer", "Hardware", 240.00, 340.00, 6, 5),
             ("SKU-1004", "Inventory Label Stickers", "Supplies", 9.00, 16.50, 14, 15),
         ]
-        extras.execute_batch(
-            cur,
-            """
-            INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (sku) DO NOTHING;
-            """,
-            starter_products,
-        )
+        _try_step(cur, "SAVEPOINT sp_seed_prods;", step_name="sp_seed_prods_init")
+        try:
+            extras.execute_batch(
+                cur,
+                """
+                INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (sku) DO NOTHING;
+                """,
+                starter_products,
+            )
+            cur.execute("RELEASE SAVEPOINT sp_seed_prods;")
+        except Exception as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_seed_prods;")
+            logger.warning("Seed products skipped: %s", exc)
 
 
 @st.cache_resource(show_spinner="Connecting to database and verifying schema...")
