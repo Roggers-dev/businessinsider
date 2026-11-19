@@ -13,6 +13,8 @@ import streamlit as st
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("businessFlow")
 
+RECOVERY_TOKEN_TTL_MINUTES = 2
+
 st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
     page_icon="📊",
@@ -308,7 +310,6 @@ def _apply_schema_and_seed(cur):
     _try_step(cur, "UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';", step_name="sync_role")
     _try_step(cur, "UPDATE users SET is_active = TRUE WHERE is_active IS NULL;", step_name="sync_is_active")
 
-    # Ensure at least one usable admin account exists if 'admin' is missing
     _try_step(
         cur,
         """
@@ -550,13 +551,16 @@ def change_user_password(username: str, current_password: str, new_password: str
         return False, f"Failed to change password: {exc}"
 
 
-def issue_password_reset_token(username: str, ttl_minutes: int = 30) -> tuple[bool, str | None]:
+def issue_password_reset_token(
+    username: str, ttl_minutes: int = RECOVERY_TOKEN_TTL_MINUTES
+) -> tuple[bool, str | None]:
     clean_user = (username or "").strip().lower()
     if not clean_user:
         return False, None
 
+    ttl = max(1, safe_int(ttl_minutes, RECOVERY_TOKEN_TTL_MINUTES))
     token = secrets.token_urlsafe(24)
-    expires_at = utc_now() + timedelta(minutes=ttl_minutes)
+    expires_at = utc_now() + timedelta(minutes=ttl)
 
     def _op(cur):
         cur.execute(
@@ -575,7 +579,7 @@ def issue_password_reset_token(username: str, ttl_minutes: int = 30) -> tuple[bo
         if not updated:
             log_audit(clean_user, "PASSWORD_RESET_REQUEST", "Requested for non-existent or inactive user")
             return False, None
-        log_audit(clean_user, "PASSWORD_RESET_TOKEN_ISSUED", f"Expires in {ttl_minutes} minutes")
+        log_audit(clean_user, "PASSWORD_RESET_TOKEN_ISSUED", f"Expires in {ttl} minutes")
         return True, token
     except Exception as exc:
         logger.exception("Failed to issue reset token for %s", clean_user)
@@ -982,10 +986,14 @@ def render_auth_screen():
                 rec_username = st.text_input("Account Username", placeholder="Enter username to recover")
                 req_token = st.form_submit_button("Generate Recovery Token", use_container_width=True)
                 if req_token:
-                    found, token = issue_password_reset_token(rec_username, ttl_minutes=30)
+                    found, token = issue_password_reset_token(rec_username, ttl_minutes=RECOVERY_TOKEN_TTL_MINUTES)
                     if found and token:
                         st.session_state["recovery_token_preview"] = token
-                        st.success("Recovery token generated (valid for 30 minutes). Copy it below to reset the password:")
+                        unit_label = "minute" if RECOVERY_TOKEN_TTL_MINUTES == 1 else "minutes"
+                        st.success(
+                            f"Recovery token generated (valid for {RECOVERY_TOKEN_TTL_MINUTES} {unit_label}). "
+                            "Copy it below to reset the password:"
+                        )
                         st.code(token, language="text")
                     else:
                         st.info("If an active account matches that username, a recovery token has been logged.")
