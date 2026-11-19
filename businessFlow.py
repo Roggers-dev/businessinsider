@@ -230,20 +230,60 @@ def _apply_schema_and_seed(cur):
                 "UPDATE users SET username = 'staff_user' WHERE username IS NULL OR TRIM(username) = '';",
                 step_name="backfill_username_default",
             )
+
+    if "id" in existing_cols:
         _try_step(
             cur,
             """
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint WHERE conname = 'users_username_unique'
-                ) THEN
-                    ALTER TABLE users ADD CONSTRAINT users_username_unique UNIQUE (username);
-                END IF;
-            END$$;
+            WITH ranked AS (
+                SELECT
+                    id,
+                    username,
+                    ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(username)) ORDER BY id ASC) AS rn
+                FROM users
+                WHERE username IS NOT NULL AND TRIM(username) <> ''
+            )
+            UPDATE users u
+            SET username = LEFT(u.username, 80) || '_' || u.id::text
+            FROM ranked r
+            WHERE u.id = r.id AND r.rn > 1;
             """,
-            step_name="add_username_unique",
+            step_name="deduplicate_usernames",
         )
+
+    _try_step(
+        cur,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relname = 'users' AND c.contype = 'u'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE tablename = 'users' AND indexdef ILIKE '%UNIQUE%username%'
+            ) THEN
+                ALTER TABLE users ADD CONSTRAINT users_username_unique UNIQUE (username);
+            END IF;
+        EXCEPTION
+            WHEN unique_violation OR duplicate_table OR duplicate_object THEN
+                NULL;
+        END$$;
+        """,
+        step_name="add_username_unique_safe",
+    )
+
+    _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;", step_name="add_password_hash")
+    for pw_candidate in ("password", "password_digest", "pass_hash", "passwd"):
+        if pw_candidate in existing_cols:
+            _try_step(
+                cur,
+                f"UPDATE users SET password_hash = {pw_candidate}::text WHERE (password_hash IS NULL OR TRIM(password_hash) = '') AND {pw_candidate} IS NOT NULL AND TRIM({pw_candidate}::text) <> '';",
+                step_name=f"backfill_password_hash_from_{pw_candidate}",
+            )
 
     for ddl, label in [
         ("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';", "add_full_name"),
@@ -267,6 +307,20 @@ def _apply_schema_and_seed(cur):
     )
     _try_step(cur, "UPDATE users SET role = 'staff' WHERE role IS NULL OR TRIM(role) = '';", step_name="sync_role")
     _try_step(cur, "UPDATE users SET is_active = TRUE WHERE is_active IS NULL;", step_name="sync_is_active")
+
+    # Ensure at least one usable admin account exists if 'admin' is missing
+    _try_step(
+        cur,
+        """
+        INSERT INTO users (username, full_name, role, password_hash, is_active)
+        SELECT 'admin', 'System Administrator', 'admin', %s, TRUE
+        WHERE NOT EXISTS (
+            SELECT 1 FROM users WHERE LOWER(TRIM(username)) = 'admin'
+        );
+        """,
+        (hash_password("Admin@1234"),),
+        step_name="ensure_admin_account",
+    )
 
     _try_step(
         cur,
@@ -319,21 +373,6 @@ def _apply_schema_and_seed(cur):
         """,
         step_name="create_audit_logs",
     )
-
-    cur.execute("SELECT COUNT(*) AS cnt FROM users;")
-    row = cur.fetchone()
-    user_count = safe_int(row["cnt"] if row else 0)
-    if user_count == 0:
-        _try_step(
-            cur,
-            """
-            INSERT INTO users (username, full_name, role, password_hash)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (username) DO NOTHING;
-            """,
-            ("admin", "System Administrator", "admin", hash_password("Admin@1234")),
-            step_name="seed_admin",
-        )
 
     cur.execute("SELECT COUNT(*) AS cnt FROM products;")
     prow = cur.fetchone()
@@ -445,7 +484,7 @@ def authenticate_user(username: str, password: str) -> dict | None:
             """
             SELECT id, username, full_name, role, password_hash, is_active
             FROM users
-            WHERE username = %s
+            WHERE LOWER(TRIM(username)) = %s
             LIMIT 1;
             """,
             (clean_user,),
@@ -478,7 +517,7 @@ def change_user_password(username: str, current_password: str, new_password: str
 
     try:
         df = run_read_query(
-            "SELECT id, password_hash, is_active FROM users WHERE username = %s LIMIT 1;",
+            "SELECT id, password_hash, is_active FROM users WHERE LOWER(TRIM(username)) = %s LIMIT 1;",
             (clean_user,),
         )
         if df.empty:
@@ -524,7 +563,7 @@ def issue_password_reset_token(username: str, ttl_minutes: int = 30) -> tuple[bo
             """
             UPDATE users
             SET reset_token = %s, reset_expires_at = %s
-            WHERE username = %s AND is_active = TRUE
+            WHERE LOWER(TRIM(username)) = %s AND is_active = TRUE
             RETURNING username;
             """,
             (token, expires_at, clean_user),
