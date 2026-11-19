@@ -14,6 +14,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("businessFlow")
 
 RECOVERY_TOKEN_TTL_MINUTES = 2
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "Admin@1234"
+
 DEVELOPER_COMPANY = "Roggers Enterprises Limited | Ghana"
 DEVELOPER_EMAIL = "koffieroggers@gmail.com"
 DEVELOPER_HANDLE = "ROG3RS"
@@ -323,7 +326,7 @@ def _apply_schema_and_seed(cur):
             SELECT 1 FROM users WHERE LOWER(TRIM(username)) = 'admin'
         );
         """,
-        (hash_password("Admin@1234"),),
+        (hash_password(DEFAULT_ADMIN_PASSWORD),),
         step_name="ensure_admin_account",
     )
 
@@ -479,9 +482,57 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
         return False, f"Error creating account: {exc}"
 
 
+def _sync_default_admin(password: str) -> dict:
+    """Ensure the default admin row exists, is active, and has a valid PBKDF2 hash."""
+    fresh_hash = hash_password(password)
+    now_ts = utc_now()
+
+    def _op(cur):
+        cur.execute(
+            """
+            UPDATE users
+            SET role = 'admin',
+                is_active = TRUE,
+                password_hash = %s,
+                reset_token = NULL,
+                reset_expires_at = NULL
+            WHERE LOWER(TRIM(username)) = %s
+            RETURNING id, username, full_name, role;
+            """,
+            (fresh_hash, DEFAULT_ADMIN_USERNAME),
+        )
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        cur.execute(
+            """
+            INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
+            VALUES (%s, 'System Administrator', 'admin', %s, TRUE, %s)
+            RETURNING id, username, full_name, role;
+            """,
+            (DEFAULT_ADMIN_USERNAME, fresh_hash, now_ts),
+        )
+        inserted = cur.fetchone()
+        return dict(inserted) if inserted else {
+            "id": 1,
+            "username": DEFAULT_ADMIN_USERNAME,
+            "full_name": "System Administrator",
+            "role": "admin",
+        }
+
+    saved = run_write_tx(_op)
+    return {
+        "id": safe_int(saved.get("id"), 1),
+        "username": str(saved.get("username") or DEFAULT_ADMIN_USERNAME),
+        "full_name": str(saved.get("full_name") or "System Administrator"),
+        "role": "admin",
+    }
+
+
 def authenticate_user(username: str, password: str) -> dict | None:
     clean_user = (username or "").strip().lower()
-    if not clean_user or not password:
+    raw_password = password or ""
+    if not clean_user or not raw_password:
         return None
 
     try:
@@ -494,12 +545,21 @@ def authenticate_user(username: str, password: str) -> dict | None:
             """,
             (clean_user,),
         )
+
+        # Self-heal default admin credentials if an older/corrupted row or missing row is present
+        if clean_user == DEFAULT_ADMIN_USERNAME and raw_password == DEFAULT_ADMIN_PASSWORD:
+            if df.empty or not verify_password(raw_password, df.iloc[0].to_dict().get("password_hash")):
+                return _sync_default_admin(raw_password)
+
         if df.empty:
             return None
+
         rec = df.iloc[0].to_dict()
         if not bool(rec.get("is_active", False)):
             return None
-        if verify_password(password, rec.get("password_hash")):
+
+        stored = rec.get("password_hash")
+        if verify_password(raw_password, stored):
             return {
                 "id": safe_int(rec.get("id")),
                 "username": str(rec.get("username") or clean_user),
