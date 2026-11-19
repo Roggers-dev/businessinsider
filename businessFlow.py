@@ -74,11 +74,11 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 # ==============================================================================
-# 3. SCHEMA INITIALIZATION & AUDIT LOGGING
+# 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
 # ==============================================================================
 @st.cache_resource
 def init_database_schema():
-    """Create all required tables and seed starter data on first run."""
+    """Create all required tables, heal missing columns on older tables, and seed starter data."""
     conn = get_connection()
     try:
         with conn:
@@ -88,12 +88,29 @@ def init_database_schema():
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
                         username VARCHAR(100) UNIQUE NOT NULL,
-                        full_name VARCHAR(150) NOT NULL,
+                        full_name VARCHAR(150) NOT NULL DEFAULT 'User',
                         role VARCHAR(30) NOT NULL DEFAULT 'staff',
                         password_hash TEXT NOT NULL,
                         is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        reset_token TEXT,
+                        reset_expires_at TIMESTAMPTZ,
                         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
+                    """
+                )
+
+                # Heal older `users` tables that may be missing expected columns
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(150) NOT NULL DEFAULT 'User';")
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'staff';")
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;")
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TIMESTAMPTZ;")
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;")
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET full_name = username
+                    WHERE full_name IS NULL OR TRIM(full_name) = '' OR full_name = 'User';
                     """
                 )
 
@@ -198,7 +215,7 @@ def log_audit(username: str, action: str, details: str = ""):
 
 
 # ==============================================================================
-# 4. USER ACCOUNT OPERATIONS (STRICT 'staff' DEFAULT ON SELF-SIGNUP)
+# 4. USER ACCOUNT, CHANGE PASSWORD & RECOVERY OPERATIONS
 # ==============================================================================
 def register_staff_user(username: str, full_name: str, password: str) -> tuple[bool, str]:
     """Create a standard 'staff' account. Admin promotion is restricted to admins."""
@@ -255,10 +272,135 @@ def authenticate_user(username: str, password: str) -> dict | None:
                 return {
                     "id": user["id"],
                     "username": user["username"],
-                    "full_name": user["full_name"],
-                    "role": user["role"],
+                    "full_name": user["full_name"] or user["username"],
+                    "role": user["role"] or "staff",
                 }
         return None
+    finally:
+        conn.close()
+
+
+def change_user_password(username: str, current_password: str, new_password: str) -> tuple[bool, str]:
+    """Verify current password and update password hash for a signed-in user."""
+    clean_user = username.strip().lower()
+    if len(new_password) < 6:
+        return False, "New password must be at least 6 characters."
+    if current_password == new_password:
+        return False, "New password must be different from your current password."
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, password_hash, is_active
+                    FROM users
+                    WHERE username = %s;
+                    """,
+                    (clean_user,),
+                )
+                user = cur.fetchone()
+                if not user or not user["is_active"]:
+                    return False, "Account not found or inactive."
+                if not verify_password(current_password, user["password_hash"]):
+                    log_audit(clean_user, "PASSWORD_CHANGE_FAILED", "Incorrect current password")
+                    return False, "Current password is incorrect."
+
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
+                    WHERE id = %s;
+                    """,
+                    (hash_password(new_password), user["id"]),
+                )
+        log_audit(clean_user, "PASSWORD_CHANGED", "Updated password via account settings")
+        return True, "Password changed successfully."
+    except Exception as exc:
+        return False, f"Failed to change password: {exc}"
+    finally:
+        conn.close()
+
+
+def issue_password_reset_token(username: str, ttl_minutes: int = 30) -> tuple[bool, str | None]:
+    """Generate a single-use recovery token for an active user."""
+    clean_user = username.strip().lower()
+    if not clean_user:
+        return False, None
+
+    token = secrets.token_urlsafe(24)
+    expires_at = utc_now() + timedelta(minutes=ttl_minutes)
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET reset_token = %s, reset_expires_at = %s
+                    WHERE username = %s AND is_active = TRUE
+                    RETURNING username;
+                    """,
+                    (token, expires_at, clean_user),
+                )
+                updated = cur.fetchone()
+        if not updated:
+            log_audit(clean_user, "PASSWORD_RESET_REQUEST", "Requested for non-existent or inactive user")
+            return False, None
+        log_audit(clean_user, "PASSWORD_RESET_TOKEN_ISSUED", f"Expires in {ttl_minutes} minutes")
+        return True, token
+    except Exception:
+        return False, None
+    finally:
+        conn.close()
+
+
+def reset_password_with_token(token: str, new_password: str) -> tuple[bool, str]:
+    """Validate a non-expired recovery token and reset the user's password."""
+    clean_token = token.strip()
+    if not clean_token:
+        return False, "Recovery token is required."
+    if len(new_password) < 6:
+        return False, "New password must be at least 6 characters."
+
+    now_ts = utc_now()
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, username, reset_expires_at, is_active
+                    FROM users
+                    WHERE reset_token = %s;
+                    """,
+                    (clean_token,),
+                )
+                user = cur.fetchone()
+                if not user or not user["is_active"]:
+                    return False, "Invalid recovery token."
+                expires_at = user["reset_expires_at"]
+                if expires_at is None:
+                    return False, "Invalid or already used recovery token."
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at < now_ts:
+                    return False, "Recovery token has expired. Request a new one."
+
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = %s, reset_token = NULL, reset_expires_at = NULL
+                    WHERE id = %s;
+                    """,
+                    (hash_password(new_password), user["id"]),
+                )
+        log_audit(user["username"], "PASSWORD_RESET_COMPLETED", "Password reset via recovery token")
+        return True, f"Password reset successful for @{user['username']}. You can now sign in."
+    except Exception as exc:
+        return False, f"Password reset failed: {exc}"
     finally:
         conn.close()
 
@@ -541,15 +683,15 @@ def fetch_audit_logs(limit: int = 100) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 6. AUTHENTICATION UI (NO ADMIN ROLE SELECTION ON SIGN-UP)
+# 6. AUTHENTICATION & PASSWORD RECOVERY UI
 # ==============================================================================
 def render_auth_screen():
     st.title("Enterprise AI Inventory & BI Command Centre")
-    st.caption("Sign in with your account or register a staff account.")
+    st.caption("Sign in, register a staff account, or recover a forgotten password.")
 
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
-        tab_login, tab_register = st.tabs(["Sign In", "Sign Up (Staff)"])
+        tab_login, tab_register, tab_recover = st.tabs(["Sign In", "Sign Up (Staff)", "Recover Password"])
 
         with tab_login:
             with st.form("login_form", clear_on_submit=False):
@@ -566,15 +708,13 @@ def render_auth_screen():
                         log_audit(username.strip().lower() or "unknown", "LOGIN_FAILED", "Invalid credentials")
                         st.error("Invalid username or password, or account is inactive.")
 
-            st.caption("Default bootstrap admin on first run: `admin` / `Admin@1234` (update password after signing in).")
-
         with tab_register:
             with st.form("register_form", clear_on_submit=True):
                 full_name = st.text_input("Full Name", placeholder="e.g. Kwame Mensah")
                 new_username = st.text_input("Username", placeholder="Lowercase, min 3 chars")
                 new_password = st.text_input("Password", type="password", placeholder="Min 6 characters")
                 confirm_password = st.text_input("Confirm Password", type="password")
-                st.caption("New sign-ups are assigned the `staff` role automatically. Admin access is granted only by an administrator.")
+                st.caption("New sign-ups default to `staff`. Admin privileges are assigned only by an administrator.")
                 created = st.form_submit_button("Create Staff Account", use_container_width=True)
                 if created:
                     if new_password != confirm_password:
@@ -582,6 +722,38 @@ def render_auth_screen():
                     else:
                         ok, msg = register_staff_user(new_username, full_name, new_password)
                         if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+        with tab_recover:
+            st.markdown("#### Step 1: Request a Reset Token")
+            with st.form("request_token_form", clear_on_submit=False):
+                rec_username = st.text_input("Account Username", placeholder="Enter username to recover")
+                req_token = st.form_submit_button("Generate Recovery Token", use_container_width=True)
+                if req_token:
+                    found, token = issue_password_reset_token(rec_username, ttl_minutes=30)
+                    if found and token:
+                        st.session_state["recovery_token_preview"] = token
+                        st.success("Recovery token generated (valid for 30 minutes). Copy it below to reset the password:")
+                        st.code(token, language="text")
+                    else:
+                        st.info("If an active account matches that username, a recovery token has been logged.")
+
+            st.markdown("#### Step 2: Set a New Password With Token")
+            default_tok = st.session_state.get("recovery_token_preview", "")
+            with st.form("reset_with_token_form", clear_on_submit=True):
+                token_input = st.text_input("Recovery Token", value=default_tok, placeholder="Paste your recovery token")
+                rec_new_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
+                rec_confirm_pw = st.text_input("Confirm New Password", type="password")
+                reset_btn = st.form_submit_button("Reset Password", type="primary", use_container_width=True)
+                if reset_btn:
+                    if rec_new_pw != rec_confirm_pw:
+                        st.error("New passwords do not match.")
+                    else:
+                        ok, msg = reset_password_with_token(token_input, rec_new_pw)
+                        if ok:
+                            st.session_state.pop("recovery_token_preview", None)
                             st.success(msg)
                         else:
                             st.error(msg)
@@ -899,6 +1071,23 @@ def render_main_app(user: dict):
         st.markdown(f"### {user['full_name']}")
         st.caption(f"@{user['username']} • Role: `{user['role']}`")
         days_window = st.selectbox("Analytics History Window", [7, 30, 90, 365], index=2)
+
+        with st.expander("Change Password"):
+            with st.form("change_password_form", clear_on_submit=True):
+                curr_pw = st.text_input("Current Password", type="password")
+                next_pw = st.text_input("New Password", type="password", placeholder="Min 6 characters")
+                confirm_next_pw = st.text_input("Confirm New Password", type="password")
+                chg_btn = st.form_submit_button("Update Password", use_container_width=True)
+                if chg_btn:
+                    if next_pw != confirm_next_pw:
+                        st.error("New passwords do not match.")
+                    else:
+                        ok, msg = change_user_password(user["username"], curr_pw, next_pw)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
         if st.button("Sign Out", use_container_width=True):
             log_audit(user["username"], "USER_LOGOUT", "Signed out")
             st.session_state.pop("auth_user", None)
