@@ -186,12 +186,24 @@ def verify_password(password: str, stored_hash: str | None) -> bool:
 # ==============================================================================
 # 3. SCHEMA INITIALIZATION, SELF-HEALING & AUDIT LOGGING
 # ==============================================================================
-def _relax_extra_not_null_columns(cur, table_name: str = "users", managed_cols: set[str] | None = None):
+def _get_table_columns(cur, table_name: str) -> set[str]:
+    try:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s;
+            """,
+            (table_name,),
+        )
+        return {str(r["column_name"]) for r in cur.fetchall() if r.get("column_name")}
+    except Exception as exc:
+        logger.warning("Could not inspect %s columns: %s", table_name, exc)
+        return set()
+
+
+def _relax_extra_not_null_columns(cur, table_name: str, managed_cols: set[str]):
     """Allow legacy extra columns without defaults to accept NULLs so inserts never fail."""
-    managed = managed_cols or {
-        "id", "username", "full_name", "role", "password_hash",
-        "is_active", "reset_token", "reset_expires_at", "created_at",
-    }
     try:
         cur.execute(
             """
@@ -203,7 +215,7 @@ def _relax_extra_not_null_columns(cur, table_name: str = "users", managed_cols: 
         )
         for col in cur.fetchall():
             col_name = str(col.get("column_name") or "")
-            if not col_name or col_name in managed:
+            if not col_name or col_name in managed_cols:
                 continue
             if str(col.get("is_nullable") or "").upper() == "NO" and col.get("column_default") is None:
                 _try_step(
@@ -215,7 +227,7 @@ def _relax_extra_not_null_columns(cur, table_name: str = "users", managed_cols: 
         logger.warning("Could not relax extra columns on %s: %s", table_name, exc)
 
 
-def _apply_schema_and_seed(cur):
+def _heal_users_table(cur):
     _try_step(
         cur,
         """
@@ -234,18 +246,7 @@ def _apply_schema_and_seed(cur):
         step_name="create_users",
     )
 
-    existing_cols: set[str] = set()
-    try:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'users';
-            """
-        )
-        existing_cols = {str(r["column_name"]) for r in cur.fetchall() if r.get("column_name")}
-    except Exception as exc:
-        logger.warning("Could not inspect users columns: %s", exc)
+    existing_cols = _get_table_columns(cur, "users")
 
     if "username" not in existing_cols:
         _try_step(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);", step_name="add_username")
@@ -333,7 +334,11 @@ def _apply_schema_and_seed(cur):
     ]:
         _try_step(cur, ddl, step_name=label)
 
-    _relax_extra_not_null_columns(cur, "users")
+    _relax_extra_not_null_columns(
+        cur,
+        "users",
+        {"id", "username", "full_name", "role", "password_hash", "is_active", "reset_token", "reset_expires_at", "created_at"},
+    )
 
     _try_step(
         cur,
@@ -361,6 +366,8 @@ def _apply_schema_and_seed(cur):
         step_name="ensure_admin_account",
     )
 
+
+def _heal_products_table(cur):
     _try_step(
         cur,
         """
@@ -378,40 +385,145 @@ def _apply_schema_and_seed(cur):
         """,
         step_name="create_products",
     )
+    cols = _get_table_columns(cur, "products")
+    for ddl, label in [
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(60);", "prod_add_sku"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS name VARCHAR(200) NOT NULL DEFAULT 'Unnamed Item';", "prod_add_name"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(100) NOT NULL DEFAULT 'General';", "prod_add_cat"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_cost"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "prod_add_price"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;", "prod_add_qty"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS reorder_level INTEGER NOT NULL DEFAULT 10;", "prod_add_reorder"),
+        ("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "prod_add_updated"),
+    ]:
+        _try_step(cur, ddl, step_name=label)
 
+    if "sku" in cols or "id" in cols:
+        _try_step(
+            cur,
+            "UPDATE products SET sku = 'SKU-' || id::text WHERE (sku IS NULL OR TRIM(sku) = '') AND id IS NOT NULL;",
+            step_name="prod_backfill_sku",
+        )
+    for alt_name in ("product_name", "title", "item_name"):
+        if alt_name in cols:
+            _try_step(
+                cur,
+                f"UPDATE products SET name = {alt_name}::text WHERE (name IS NULL OR TRIM(name) = '' OR name = 'Unnamed Item') AND {alt_name} IS NOT NULL;",
+                step_name=f"prod_backfill_name_{alt_name}",
+            )
+    for alt_qty in ("quantity", "qty", "stock"):
+        if alt_qty in cols:
+            _try_step(
+                cur,
+                f"UPDATE products SET stock_qty = COALESCE({alt_qty}::integer, 0) WHERE stock_qty = 0 AND {alt_qty} IS NOT NULL;",
+                step_name=f"prod_backfill_qty_{alt_qty}",
+            )
+    _relax_extra_not_null_columns(
+        cur,
+        "products",
+        {"id", "sku", "name", "category", "unit_cost", "selling_price", "stock_qty", "reorder_level", "updated_at"},
+    )
+
+
+def _heal_transactions_table(cur):
     _try_step(
         cur,
         """
         CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
-            tx_type VARCHAR(20) NOT NULL,
-            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
-            sku VARCHAR(60) NOT NULL,
-            product_name VARCHAR(200) NOT NULL,
-            quantity INTEGER NOT NULL,
+            tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE',
+            product_id INTEGER,
+            sku VARCHAR(60) NOT NULL DEFAULT '',
+            product_name VARCHAR(200) NOT NULL DEFAULT '',
+            quantity INTEGER NOT NULL DEFAULT 0,
             unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
             total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-            recorded_by VARCHAR(100) NOT NULL,
+            recorded_by VARCHAR(100) NOT NULL DEFAULT 'system',
             notes TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
         """,
         step_name="create_transactions",
     )
+    cols = _get_table_columns(cur, "transactions")
+    for ddl, label in [
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_type VARCHAR(20) NOT NULL DEFAULT 'SALE';", "tx_add_tx_type"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_id INTEGER;", "tx_add_product_id"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sku VARCHAR(60) NOT NULL DEFAULT '';", "tx_add_sku"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product_name VARCHAR(200) NOT NULL DEFAULT '';", "tx_add_prod_name"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;", "tx_add_qty"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_unit_price"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00;", "tx_add_total"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recorded_by VARCHAR(100) NOT NULL DEFAULT 'system';", "tx_add_recorded_by"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS notes TEXT;", "tx_add_notes"),
+        ("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "tx_add_created_at"),
+    ]:
+        _try_step(cur, ddl, step_name=label)
 
+    for alt_type in ("type", "transaction_type", "movement_type"):
+        if alt_type in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET tx_type = UPPER(TRIM({alt_type}::text)) WHERE (tx_type IS NULL OR TRIM(tx_type) = '') AND {alt_type} IS NOT NULL;",
+                step_name=f"tx_backfill_type_{alt_type}",
+            )
+    for alt_qty in ("qty", "stock_qty"):
+        if alt_qty in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET quantity = COALESCE({alt_qty}::integer, 0) WHERE quantity = 0 AND {alt_qty} IS NOT NULL;",
+                step_name=f"tx_backfill_qty_{alt_qty}",
+            )
+    for alt_amt in ("amount", "total", "price"):
+        if alt_amt in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET total_amount = COALESCE({alt_amt}::numeric, 0.00) WHERE total_amount = 0 AND {alt_amt} IS NOT NULL;",
+                step_name=f"tx_backfill_amt_{alt_amt}",
+            )
+    for alt_actor in ("user", "username", "created_by", "actor"):
+        if alt_actor in cols:
+            _try_step(
+                cur,
+                f"UPDATE transactions SET recorded_by = {alt_actor}::text WHERE (recorded_by IS NULL OR TRIM(recorded_by) = '' OR recorded_by = 'system') AND {alt_actor} IS NOT NULL;",
+                step_name=f"tx_backfill_actor_{alt_actor}",
+            )
+    _relax_extra_not_null_columns(
+        cur,
+        "transactions",
+        {"id", "tx_type", "product_id", "sku", "product_name", "quantity", "unit_price", "total_amount", "recorded_by", "notes", "created_at"},
+    )
+
+
+def _heal_audit_logs_table(cur):
     _try_step(
         cur,
         """
         CREATE TABLE IF NOT EXISTS audit_logs (
             id SERIAL PRIMARY KEY,
-            username VARCHAR(100) NOT NULL,
-            action VARCHAR(120) NOT NULL,
+            username VARCHAR(100) NOT NULL DEFAULT 'system',
+            action VARCHAR(120) NOT NULL DEFAULT 'EVENT',
             details TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
         """,
         step_name="create_audit_logs",
     )
+    for ddl, label in [
+        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS username VARCHAR(100) NOT NULL DEFAULT 'system';", "audit_add_user"),
+        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS action VARCHAR(120) NOT NULL DEFAULT 'EVENT';", "audit_add_action"),
+        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS details TEXT;", "audit_add_details"),
+        ("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;", "audit_add_created"),
+    ]:
+        _try_step(cur, ddl, step_name=label)
+    _relax_extra_not_null_columns(cur, "audit_logs", {"id", "username", "action", "details", "created_at"})
+
+
+def _apply_schema_and_seed(cur):
+    _heal_users_table(cur)
+    _heal_products_table(cur)
+    _heal_transactions_table(cur)
+    _heal_audit_logs_table(cur)
 
     cur.execute("SELECT COUNT(*) AS cnt FROM products;")
     prow = cur.fetchone()
@@ -460,6 +572,7 @@ def log_audit(username: str, action: str, details: str = ""):
         now_ts = utc_now()
 
         def _op(cur):
+            _heal_audit_logs_table(cur)
             cur.execute(
                 """
                 INSERT INTO audit_logs (username, action, details, created_at)
@@ -491,7 +604,7 @@ def register_staff_user(username: str, full_name: str, password: str) -> tuple[b
     now_ts = utc_now()
 
     def _op(cur):
-        _relax_extra_not_null_columns(cur, "users")
+        _heal_users_table(cur)
         cur.execute(
             """
             INSERT INTO users (username, full_name, role, password_hash, is_active, created_at)
@@ -520,7 +633,7 @@ def _sync_default_admin(password: str) -> dict:
     now_ts = utc_now()
 
     def _op(cur):
-        _relax_extra_not_null_columns(cur, "users")
+        _heal_users_table(cur)
         cur.execute(
             """
             UPDATE users
@@ -579,7 +692,6 @@ def authenticate_user(username: str, password: str) -> dict | None:
             (clean_user,),
         )
 
-        # Self-heal default admin credentials if an older/corrupted row or missing row is present
         if clean_user == DEFAULT_ADMIN_USERNAME and raw_password == DEFAULT_ADMIN_PASSWORD:
             if df.empty or not verify_password(raw_password, df.iloc[0].to_dict().get("password_hash")):
                 return _sync_default_admin(raw_password)
@@ -817,6 +929,7 @@ def update_user_role_or_status(
 # ==============================================================================
 def fetch_products() -> pd.DataFrame:
     try:
+        run_write_tx(_heal_products_table)
         df = run_read_query(
             """
             SELECT
@@ -883,6 +996,8 @@ def add_or_update_product(
     now_ts = utc_now()
 
     def _op(cur):
+        _heal_products_table(cur)
+        _heal_transactions_table(cur)
         cur.execute(
             """
             INSERT INTO products (sku, name, category, unit_cost, selling_price, stock_qty, reorder_level, updated_at)
@@ -936,6 +1051,8 @@ def record_stock_movement(
     clean_notes = (notes or "").strip()
 
     def _op(cur):
+        _heal_products_table(cur)
+        _heal_transactions_table(cur)
         cur.execute("SELECT * FROM products WHERE id = %s FOR UPDATE;", (int(product_id),))
         prod = cur.fetchone()
         if not prod:
@@ -1014,7 +1131,12 @@ def delete_product(product_id: int, actor_role: str, actor: str) -> tuple[bool, 
 
 
 def fetch_transactions(days: int = 90) -> pd.DataFrame:
+    empty_cols = [
+        "id", "tx_type", "sku", "product_name", "quantity",
+        "unit_price", "total_amount", "recorded_by", "notes", "created_at",
+    ]
     try:
+        run_write_tx(_heal_transactions_table)
         cutoff = utc_now() - timedelta(days=max(1, safe_int(days, 90)))
         df = run_read_query(
             """
@@ -1036,23 +1158,19 @@ def fetch_transactions(days: int = 90) -> pd.DataFrame:
             (cutoff,),
         )
         if df.empty:
-            return pd.DataFrame(
-                columns=[
-                    "id", "tx_type", "sku", "product_name", "quantity",
-                    "unit_price", "total_amount", "recorded_by", "notes", "created_at",
-                ]
-            )
+            return pd.DataFrame(columns=empty_cols)
         df["quantity"] = df["quantity"].apply(safe_int)
         df["unit_price"] = df["unit_price"].apply(safe_float)
         df["total_amount"] = df["total_amount"].apply(safe_float)
         return df
     except Exception as exc:
         st.error(f"Failed to load transactions: {exc}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=empty_cols)
 
 
 def fetch_audit_logs(limit: int = 100) -> pd.DataFrame:
     try:
+        run_write_tx(_heal_audit_logs_table)
         return run_read_query(
             """
             SELECT id, username, action, details, created_at
@@ -1183,7 +1301,6 @@ def render_auth_screen():
                             st.error(msg)
 
         render_developer_footer()
-
 
 # ==============================================================================
 # 8. MAIN APPLICATION MODULES & ROLE-LOCKED TABS
