@@ -1,4 +1,7 @@
 from datetime import datetime, timedelta
+import hashlib
+import os
+import sqlite3
 import urllib.parse
 import numpy as np
 import pandas as pd
@@ -6,9 +9,21 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+  import psycopg2
+  from psycopg2.extras import RealDictCursor
+
+  PSYCOPG2_AVAILABLE = True
+except ImportError:
+  PSYCOPG2_AVAILABLE = False
+
 # ---------------------------------------------------------
-# PAGE CONFIGURATION
+# DEVELOPER & PAGE CONFIGURATION
 # ---------------------------------------------------------
+DEVELOPER_ORG = "Rogers Enterprise Limited | Ghana"
+DEVELOPER_EMAIL = "koffieroggers@gmail.com"
+LOCAL_AUTH_DB = "rogers_bi_auth.db"
+
 st.set_page_config(
     page_title="Enterprise AI Inventory & BI Command Centre",
     page_icon="🌍",
@@ -16,17 +31,252 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("🌍 Enterprise-Grade Supply Chain & BI Intelligence Suite")
-st.markdown(
-    "Inspired by **Amazon, Jumia, and Alibaba** operational architectures —"
-    " Featuring ABC Pareto Classification, Safety Stock Buffers, SKU Tiering,"
-    " Universal CSV/Excel Multitask Analysis, and AI Future Diagnosis."
-    " Empowered by **Rogers Enterprises Limited | Ghana**."
-)
+
+# ---------------------------------------------------------
+# NEON POSTGRES + SAFE LOCAL FALLBACK LAYER
+# ---------------------------------------------------------
+def get_neon_url() -> str:
+  try:
+    if "neon" in st.secrets and st.secrets["neon"].get("database_url"):
+      return str(st.secrets["neon"]["database_url"]).strip()
+  except Exception:
+    pass
+  try:
+    if st.secrets.get("DATABASE_URL"):
+      return str(st.secrets["DATABASE_URL"]).strip()
+  except Exception:
+    pass
+  for env_key in ("NEON_DATABASE_URL", "DATABASE_URL"):
+    val = os.getenv(env_key, "").strip()
+    if val:
+      return val
+  return ""
+
+
+def using_neon() -> bool:
+  return bool(get_neon_url()) and PSYCOPG2_AVAILABLE
+
+
+def get_local_sqlite_conn():
+  conn = sqlite3.connect(LOCAL_AUTH_DB, check_same_thread=False)
+  conn.row_factory = sqlite3.Row
+  return conn
+
+
+def init_auth_and_audit_storage():
+  if using_neon():
+    conn = psycopg2.connect(get_neon_url(), sslmode="require")
+    try:
+      with conn.cursor() as cur:
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_users (
+                        id SERIAL PRIMARY KEY,
+                        full_name VARCHAR(150) NOT NULL,
+                        email VARCHAR(180) UNIQUE NOT NULL,
+                        organization VARCHAR(180) DEFAULT 'Rogers Enterprise Limited | Ghana',
+                        password_hash TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_login TIMESTAMP
+                    );
+                """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS clean_audit_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_email VARCHAR(180) NOT NULL,
+                        file_name VARCHAR(255),
+                        overview_summary TEXT,
+                        conclusion_text TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+      conn.commit()
+    finally:
+      conn.close()
+  else:
+    conn = get_local_sqlite_conn()
+    try:
+      conn.execute("""
+                CREATE TABLE IF NOT EXISTS app_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    organization TEXT DEFAULT 'Rogers Enterprise Limited | Ghana',
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_login TEXT
+                )
+            """)
+      conn.execute("""
+                CREATE TABLE IF NOT EXISTS clean_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_email TEXT NOT NULL,
+                    file_name TEXT,
+                    overview_summary TEXT,
+                    conclusion_text TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+      conn.commit()
+    finally:
+      conn.close()
+
+
+def hash_password(password: str, salt: str = None) -> str:
+  if salt is None:
+    salt = os.urandom(16).hex()
+  dk = hashlib.pbkdf2_hmac(
+      "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
+  )
+  return f"{salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+  if not stored_hash or "$" not in stored_hash:
+    return False
+  salt, expected_hex = stored_hash.split("$", 1)
+  dk = hashlib.pbkdf2_hmac(
+      "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
+  )
+  return dk.hex() == expected_hex
+
+
+def register_user(full_name: str, email: str, password: str, org: str):
+  norm_email = email.strip().lower()
+  pw_hash = hash_password(password)
+  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  if using_neon():
+    conn = psycopg2.connect(get_neon_url(), sslmode="require")
+    try:
+      with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM app_users WHERE LOWER(email) = %s", (norm_email,)
+        )
+        if cur.fetchone():
+          return False, "An account with this email already exists in Neon."
+        cur.execute(
+            """
+                        INSERT INTO app_users (full_name, email, organization, password_hash, last_login)
+                        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    """,
+            (
+                full_name.strip(),
+                norm_email,
+                org.strip() or DEVELOPER_ORG,
+                pw_hash,
+            ),
+        )
+      conn.commit()
+      return True, "Account created in Neon Postgres. You are now signed in."
+    finally:
+      conn.close()
+  else:
+    conn = get_local_sqlite_conn()
+    try:
+      existing = conn.execute(
+          "SELECT id FROM app_users WHERE LOWER(email) = ?", (norm_email,)
+      ).fetchone()
+      if existing:
+        return False, "An account with this email already exists."
+      conn.execute(
+          """
+                INSERT INTO app_users (full_name, email, organization, password_hash, created_at, last_login)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+          (
+              full_name.strip(),
+              norm_email,
+              org.strip() or DEVELOPER_ORG,
+              pw_hash,
+              now_str,
+              now_str,
+          ),
+      )
+      conn.commit()
+      return (
+          True,
+          "Account created (local fallback active). You are now signed in.",
+      )
+    finally:
+      conn.close()
+
+
+def authenticate_user(email: str, password: str):
+  norm_email = email.strip().lower()
+  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  if using_neon():
+    conn = psycopg2.connect(get_neon_url(), sslmode="require")
+    try:
+      with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM app_users WHERE LOWER(email) = %s", (norm_email,)
+        )
+        user = cur.fetchone()
+        if user and verify_password(password, user["password_hash"]):
+          cur.execute(
+              "UPDATE app_users SET last_login = CURRENT_TIMESTAMP WHERE id = %s",
+              (user["id"],),
+          )
+          conn.commit()
+          return True, dict(user)
+      return False, None
+    finally:
+      conn.close()
+  else:
+    conn = get_local_sqlite_conn()
+    try:
+      row = conn.execute(
+          "SELECT * FROM app_users WHERE LOWER(email) = ?", (norm_email,)
+      ).fetchone()
+      if row and verify_password(password, row["password_hash"]):
+        conn.execute(
+            "UPDATE app_users SET last_login = ? WHERE id = ?",
+            (now_str, row["id"]),
+        )
+        conn.commit()
+        return True, dict(row)
+      return False, None
+    finally:
+      conn.close()
+
+
+def record_clean_audit(
+    user_email: str, file_name: str, overview_text: str, conclusion_text: str
+):
+  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  try:
+    if using_neon():
+      conn = psycopg2.connect(get_neon_url(), sslmode="require")
+      try:
+        with conn.cursor() as cur:
+          cur.execute(
+              """
+                            INSERT INTO clean_audit_logs (user_email, file_name, overview_summary, conclusion_text)
+                            VALUES (%s, %s, %s, %s)
+                        """,
+              (user_email, file_name, overview_text, conclusion_text),
+          )
+        conn.commit()
+      finally:
+        conn.close()
+    else:
+      conn = get_local_sqlite_conn()
+      try:
+        conn.execute(
+            """
+                    INSERT INTO clean_audit_logs (user_email, file_name, overview_summary, conclusion_text, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+            (user_email, file_name, overview_text, conclusion_text, now_str),
+        )
+        conn.commit()
+      finally:
+        conn.close()
+  except Exception:
+    pass
 
 
 # ---------------------------------------------------------
-# SHARED SAFE HELPERS
+# SHARED SAFE DATA HELPERS
 # ---------------------------------------------------------
 def clean_text_cell(v):
   if v is None:
@@ -91,6 +341,136 @@ def load_any_tabular_file(uploaded_file, key_prefix="lab"):
     uploaded_file.seek(0)
     return pd.read_excel(uploaded_file, sheet_name=sheet_name)
 
+
+def snapshot_metrics(df: pd.DataFrame) -> dict:
+  rows_cnt = int(len(df))
+  cols_cnt = int(len(df.columns))
+  missing_cnt = int(df.isna().sum().sum()) if rows_cnt > 0 else 0
+  try:
+    dup_cnt = int(df.duplicated().sum()) if rows_cnt > 0 else 0
+  except Exception:
+    dup_cnt = 0
+
+  numeric_ready_cols = 0
+  for c in df.columns:
+    num_s = clean_numeric_series(df[c])
+    non_blank = df[c].apply(clean_text_cell).notna().sum()
+    if non_blank > 0 and (num_s.notna().sum() / non_blank) >= 0.7:
+      numeric_ready_cols += 1
+
+  return {
+      "rows": rows_cnt,
+      "cols": cols_cnt,
+      "missing_cells": missing_cnt,
+      "duplicates": dup_cnt,
+      "numeric_ready_cols": numeric_ready_cols,
+  }
+
+
+# ---------------------------------------------------------
+# INITIALIZE STORAGE & AUTH GATE
+# ---------------------------------------------------------
+init_auth_and_audit_storage()
+
+if "auth_user" not in st.session_state:
+  st.session_state.auth_user = None
+
+if st.session_state.auth_user is None:
+  st.title("🔐 Sign In / Sign Up — Enterprise BI Command Centre")
+  st.markdown(
+      f"**{DEVELOPER_ORG}** • Contact: `{DEVELOPER_EMAIL}`  \n"
+      "Please **Sign In** or **Sign Up** to access supply chain analytics,"
+      " universal CSV/Excel cleaning, regression, and AI future diagnosis."
+  )
+  db_badge = (
+      "🟢 Connected to **Neon Postgres** (`sslmode=require`)"
+      if using_neon()
+      else (
+          "🟡 Local SQLite Fallback Active (add `[neon] database_url` in"
+          " `.streamlit/secrets.toml` to connect Neon)"
+      )
+  )
+  st.info(db_badge)
+
+  tab_login, tab_signup = st.tabs(["🔑 Sign In", "📝 Sign Up (Create Account)"])
+
+  with tab_login:
+    with st.form("login_form"):
+      login_email = st.text_input("Email Address")
+      login_pw = st.text_input("Password", type="password")
+      submitted_login = st.form_submit_button("Sign In")
+      if submitted_login:
+        if not login_email.strip() or not login_pw:
+          st.warning("Please enter both your email address and password.")
+        else:
+          try:
+            ok, user_data = authenticate_user(login_email, login_pw)
+            if ok and user_data:
+              st.session_state.auth_user = user_data
+              st.success(f"Welcome back, {user_data['full_name']}!")
+              st.rerun()
+            else:
+              st.error("Invalid email or password.")
+          except Exception as exc:
+            st.error(f"Sign-in error: {exc}")
+
+  with tab_signup:
+    with st.form("signup_form"):
+      reg_name = st.text_input("Full Name")
+      reg_email = st.text_input("Email Address")
+      reg_org = st.text_input("Business / Organization", value=DEVELOPER_ORG)
+      reg_pw = st.text_input("Create Password (min. 6 characters)", type="password")
+      reg_pw2 = st.text_input("Confirm Password", type="password")
+      submitted_reg = st.form_submit_button("Create Account & Sign In")
+      if submitted_reg:
+        if not reg_name.strip() or not reg_email.strip() or len(reg_pw) < 6:
+          st.warning(
+              "Please enter your full name, a valid email, and a password of at"
+              " least 6 characters."
+          )
+        elif reg_pw != reg_pw2:
+          st.error("Passwords do not match.")
+        else:
+          try:
+            ok, msg = register_user(reg_name, reg_email, reg_pw, reg_org)
+            if ok:
+              _, user_data = authenticate_user(reg_email, reg_pw)
+              st.session_state.auth_user = user_data
+              st.success(msg)
+              st.rerun()
+            else:
+              st.error(msg)
+          except Exception as exc:
+            st.error(f"Sign-up error: {exc}")
+
+  st.stop()
+
+
+# ---------------------------------------------------------
+# AUTHENTICATED WORKSPACE HEADER & SIDEBAR
+# ---------------------------------------------------------
+active_user = st.session_state.auth_user
+
+with st.sidebar:
+  st.success(
+      f"👤 **{active_user['full_name']}**  \n`{active_user['email']}`  \n"
+      + (
+          "🟢 Neon Postgres Synced"
+          if using_neon()
+          else "🟡 Local Auth Fallback"
+      )
+  )
+  if st.button("🚪 Sign Out", use_container_width=True):
+    st.session_state.auth_user = None
+    st.rerun()
+
+st.title("🌍 Enterprise-Grade Supply Chain & BI Intelligence Suite")
+st.markdown(
+    "Inspired by **Amazon, Jumia, and Alibaba** operational architectures —"
+    " Featuring ABC Pareto Classification, Safety Stock Buffers, SKU Tiering,"
+    " Universal CSV/Excel Multitask Analysis, and AI Future Diagnosis.  \n"
+    f"Empowered by **{DEVELOPER_ORG}** • `{DEVELOPER_EMAIL}`."
+)
 
 # ---------------------------------------------------------
 # SIDEBAR DATA INPUTS & SETTINGS
@@ -368,8 +748,8 @@ if sales_file and stock_file:
         digits_only = "".join(ch for ch in str(raw_phone) if ch.isdigit())
         sup_phone = digits_only if digits_only else "233000000000"
         order_msg = (
-            "Hello Supplier, automated reorder generated by AlufaTanaah"
-            f" Enterprise Suite. Item: *{sku_row['ItemName']}* | ABC Class:"
+            "Hello Supplier, automated reorder generated by Rogers Enterprise"
+            f" BI Suite. Item: *{sku_row['ItemName']}* | ABC Class:"
             f" *{str(sku_row['ABC_Category']).split()[0]}* | Restock Quantity"
             f" Required: *{sku_row['RecommendedOrderQty']} units* | Estimated PO"
             f" Cost: *GHS {sku_row['EstimatedOrderCost']:,.2f}*. Please confirm"
@@ -415,8 +795,7 @@ else:
       " launch the Enterprise BI Suite."
   )
 
-
-# =========================================================
+    # =========================================================
 # EXTRA FEATURE: UNIVERSAL CSV / EXCEL MULTITASK ANALYZER,
 # ANOMALY FLAGGER, COMMANDED CLEANER, DATE FORMATTER,
 # SWIFT MEASUREMENTS + REGRESSION & AI FUTURE DIAGNOSIS
@@ -426,7 +805,8 @@ st.header("🧪 Universal CSV & Excel Multitask Data Lab")
 st.markdown(
     "Upload **any CSV or Excel file** (`.csv`, `.xlsx`, `.xls`) to multitask"
     " analysis, flag dangers/abnormalities, command cleaning or keep raw"
-    " formatting, format dates on button click, highlight fixed areas, run"
+    " formatting, inspect a **post-clean overview**, compare **Before vs."
+    " After formatting with conclusions**, format dates on button click, run"
     " swift statistical & regression calculations, and get **AI Data Diagnosis"
     " for Future Outlook**."
 )
@@ -539,16 +919,18 @@ if lab_file is not None:
   file_sig = f"{lab_file.name}_{lab_file.size}"
   if st.session_state.get("lab_file_sig") != file_sig:
     st.session_state["lab_file_sig"] = file_sig
-    st.session_state["lab_working_df"] = load_any_tabular_file(
-        lab_file, key_prefix="lab_main"
-    )
+    loaded_df = load_any_tabular_file(lab_file, key_prefix="lab_main")
+    st.session_state["lab_working_df"] = loaded_df
+    st.session_state["lab_initial_metrics"] = snapshot_metrics(loaded_df)
     st.session_state["lab_fix_highlights"] = []
+    st.session_state["lab_clean_report"] = None
 
   if "lab_working_df" not in st.session_state:
-    st.session_state["lab_working_df"] = load_any_tabular_file(
-        lab_file, key_prefix="lab_main"
-    )
+    loaded_df = load_any_tabular_file(lab_file, key_prefix="lab_main")
+    st.session_state["lab_working_df"] = loaded_df
+    st.session_state["lab_initial_metrics"] = snapshot_metrics(loaded_df)
     st.session_state["lab_fix_highlights"] = []
+    st.session_state["lab_clean_report"] = None
 
   work_df = st.session_state["lab_working_df"].copy()
 
@@ -562,7 +944,7 @@ if lab_file is not None:
     dup_total = 0
   k4.metric("Duplicate Rows", f"{dup_total:,}")
 
-    # 1. DANGERS & ABNORMALITIES SCANNER
+  # 1. DANGERS & ABNORMALITIES SCANNER
   st.subheader("🚨 Dangers & Abnormalities Scanner")
   df_flags = detect_abnormalities(work_df)
   if not df_flags.empty:
@@ -639,49 +1021,156 @@ if lab_file is not None:
     apply_clean_cmd = st.form_submit_button("⚡ Execute Selected Clean Commands")
 
   if apply_clean_cmd:
+    before_snap = snapshot_metrics(work_df)
     applied_notes = []
+    actions_taken = []
+
     if col_headers_dirty and cmd_headers.startswith("Clean"):
       rename_map = {
           c: " ".join(str(c).strip().split()) for c in col_headers_dirty
       }
       work_df = work_df.rename(columns=rename_map)
-      applied_notes.append(
-          f"Formatted {len(rename_map)} column header(s):"
+      msg = (
+          f"Trimmed/normalized {len(rename_map)} header(s):"
           f" {list(rename_map.values())}"
       )
+      applied_notes.append(msg)
+      actions_taken.append(msg)
 
     if cmd_text_trim.startswith("Clean"):
+      text_touched = 0
       for c in work_df.columns:
         if (
             work_df[c].dtype == object
             or pd.api.types.is_string_dtype(work_df[c])
         ):
           work_df[c] = work_df[c].apply(clean_text_cell)
-      applied_notes.append(
-          "Trimmed extra whitespace and standardized blank text markers across"
-          " text columns."
+          text_touched += 1
+      msg = (
+          f"Standardized whitespace and converted empty/placeholder strings to"
+          f" true nulls across {text_touched} text column(s)."
       )
+      applied_notes.append(msg)
+      actions_taken.append(msg)
 
     if numeric_candidate_cols and cmd_num_parse.startswith("Clean"):
+      num_converted = []
       for c in numeric_candidate_cols:
         if c in work_df.columns:
           work_df[c] = clean_numeric_series(work_df[c])
-      applied_notes.append(
-          "Converted currency/symbol numeric strings to clean numbers in:"
-          f" {numeric_candidate_cols}"
-      )
+          num_converted.append(str(c))
+      if num_converted:
+        msg = (
+            "Stripped currency/comma symbols and parsed numeric values in:"
+            f" {', '.join(num_converted)}."
+        )
+        applied_notes.append(msg)
+        actions_taken.append(msg)
 
     if cmd_dedup.startswith("Clean & Remove"):
       before_len = len(work_df)
       work_df = work_df.drop_duplicates().reset_index(drop=True)
       removed_cnt = before_len - len(work_df)
-      applied_notes.append(f"Removed {removed_cnt} exact duplicate row(s).")
+      msg = f"Removed {removed_cnt} exact duplicate row(s)."
+      applied_notes.append(msg)
+      actions_taken.append(msg)
+
+    after_snap = snapshot_metrics(work_df)
+
+    # Draw conclusions from Before vs. After
+    conclusions = []
+    if after_snap["duplicates"] < before_snap["duplicates"]:
+      conclusions.append(
+          f"Duplicate inflation was eliminated ({before_snap['duplicates']} →"
+          f" {after_snap['duplicates']}), preventing double-counting in totals"
+          " and averages."
+      )
+    if after_snap["numeric_ready_cols"] > before_snap["numeric_ready_cols"]:
+      conclusions.append(
+          f"Numeric readiness improved ({before_snap['numeric_ready_cols']} →"
+          f" {after_snap['numeric_ready_cols']} numeric columns), enabling"
+          " reliable statistical summaries, regression, and forecasting."
+      )
+    if after_snap["missing_cells"] > before_snap["missing_cells"]:
+      conclusions.append(
+          f"Hidden text placeholders ('nan'/'None'/blanks) were surfaced as"
+          f" explicit missing values ({before_snap['missing_cells']} →"
+          f" {after_snap['missing_cells']}), making data gaps transparent"
+          " rather than disguised as text."
+      )
+    if not conclusions:
+      conclusions.append(
+          "Dataset structure and integrity remain consistent; selected rules"
+          " were applied without distorting record counts."
+      )
+
+    overview_str = (
+        "; ".join(actions_taken)
+        if actions_taken
+        else "No cleaning rules were selected ('Do Not Clean' chosen)."
+    )
+    conclusion_str = " ".join(conclusions)
 
     st.session_state["lab_working_df"] = work_df
     st.session_state["lab_fix_highlights"] = (
         st.session_state.get("lab_fix_highlights", []) + applied_notes
     )
+    st.session_state["lab_clean_report"] = {
+        "before": before_snap,
+        "after": after_snap,
+        "overview": overview_str,
+        "conclusions": conclusions,
+    }
+    record_clean_audit(
+        active_user["email"], lab_file.name, overview_str, conclusion_str
+    )
     st.rerun()
+
+  # BRIEF OVERVIEW + BEFORE VS AFTER COMPARISON + CONCLUSIONS
+  if st.session_state.get("lab_clean_report"):
+    rep = st.session_state["lab_clean_report"]
+    st.markdown("### 📋 Post-Clean Overview, Before vs. After & Conclusions")
+    st.info(f"**Brief Overview of What Formatting Did:** {rep['overview']}")
+
+    b_m = rep["before"]
+    a_m = rep["after"]
+    comp_df = pd.DataFrame([
+        {
+            "Metric": "Row Count",
+            "Before Formatting": b_m["rows"],
+            "After Formatting": a_m["rows"],
+            "Change": a_m["rows"] - b_m["rows"],
+        },
+        {
+            "Metric": "Column Count",
+            "Before Formatting": b_m["cols"],
+            "After Formatting": a_m["cols"],
+            "Change": a_m["cols"] - b_m["cols"],
+        },
+        {
+            "Metric": "Missing / Null Cells",
+            "Before Formatting": b_m["missing_cells"],
+            "After Formatting": a_m["missing_cells"],
+            "Change": a_m["missing_cells"] - b_m["missing_cells"],
+        },
+        {
+            "Metric": "Exact Duplicate Rows",
+            "Before Formatting": b_m["duplicates"],
+            "After Formatting": a_m["duplicates"],
+            "Change": a_m["duplicates"] - b_m["duplicates"],
+        },
+        {
+            "Metric": "Numeric-Ready Columns",
+            "Before Formatting": b_m["numeric_ready_cols"],
+            "After Formatting": a_m["numeric_ready_cols"],
+            "Change": a_m["numeric_ready_cols"] - b_m["numeric_ready_cols"],
+        },
+    ])
+    st.dataframe(comp_df, use_container_width=True)
+
+    st.markdown("**🔍 Key Conclusions:**")
+    for c_line in rep["conclusions"]:
+      st.success(f"• {c_line}")
 
   # 3. ON-DEMAND DATE FORMATTER BUTTON
   st.subheader("📅 On-Demand Date Formatter")
@@ -731,6 +1220,12 @@ if lab_file is not None:
     st.session_state["lab_fix_highlights"] = (
         st.session_state.get("lab_fix_highlights", []) + [note]
     )
+    record_clean_audit(
+        active_user["email"],
+        lab_file.name,
+        note,
+        f"Date column '{selected_date_col}' standardized to {target_date_fmt} for chronological accuracy.",
+    )
     st.rerun()
 
   # 4. HIGHLIGHT AREAS FIXED & FORMATTED
@@ -741,7 +1236,7 @@ if lab_file is not None:
 
   st.dataframe(work_df, use_container_width=True)
 
-  # 5. SWIFT MEASUREMENTS & REGRESSION CALCULATOR
+    # 5. SWIFT MEASUREMENTS & REGRESSION CALCULATOR
   st.markdown("---")
   st.subheader(
       "📐 Swift Measurements & Regression Calculator (Mean, Average, Median,"
@@ -1036,3 +1531,11 @@ if lab_file is not None:
       mime="text/csv",
       key="lab_download_cleaned",
   )
+
+# ---------------------------------------------------------
+# FOOTER
+# ---------------------------------------------------------
+st.markdown("---")
+st.caption(
+    f"**{DEVELOPER_ORG}** • Support & Inquiries: `{DEVELOPER_EMAIL}`"
+)
